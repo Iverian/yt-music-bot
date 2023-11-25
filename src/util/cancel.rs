@@ -42,7 +42,7 @@ async fn wait_for_any_handle(handles: Vec<Handle>) -> Result<Vec<Handle>, (Vec<H
     let (r, _, other) = futures::future::select_all(handles).await;
     match r {
         Ok(r) => match r {
-            Ok(_) => Ok(other),
+            Ok(()) => Ok(other),
             Err(e) => Err((other, e)),
         },
         Err(e) => Err((other, e.into())),

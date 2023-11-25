@@ -9,15 +9,27 @@ use once_cell::sync::Lazy;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use regex::Regex;
 use rust_embed::RustEmbed;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
-static SERVER_CODE: Lazy<String> =
-    Lazy::new(|| String::from_utf8(PythonFiles::get("server.py").unwrap().data.to_vec()).unwrap());
-static YOUTUBE_URL: Lazy<Url> = Lazy::new(|| "https://www.youtube.com/watch".parse().unwrap());
-const YOUTUBE_HOSTS: &[&str] = &["youtu.be", "youtube.com", "www.youtube.com"];
+use crate::util::channel::ChannelError;
+
+const PYTHON_FILE: &str = "youtube.py";
+const PYTHON_MODULE: &str = "youtube";
+const PYTHON_CLASS: &str = "Youtube";
+const PYTHON_RESOLVE_METHOD: &str = "resolve";
+const PYTHON_DOWNLOAD_METHOD: &str = "download";
+const PYTHON_CLOSE_METHOD: &str = "close";
+
+const HOSTS: &[&str] = &["youtu.be", "youtube.com", "www.youtube.com"];
+
+static PYTHON_CODE: Lazy<String> =
+    Lazy::new(|| String::from_utf8(PythonFiles::get(PYTHON_FILE).unwrap().data.to_vec()).unwrap());
+static BASE_URL: Lazy<Url> = Lazy::new(|| "https://www.youtube.com/watch".parse().unwrap());
+static ERROR_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^ERROR: \[.*\] (.+)$").unwrap());
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -28,14 +40,14 @@ pub struct Youtube {
 
 #[derive(Debug, Clone, Error)]
 pub enum Error {
-    #[error("channel error")]
-    Channel,
-    #[error("invalid url: {0}")]
+    #[error("Invalid url: {0}")]
     InvalidUrl(Url),
-    #[error("unknown youtube object: {0}")]
+    #[error("Unknown youtube object: {0}")]
     UnknownObject(String),
-    #[error("error for url {0}: {1}")]
+    #[error("Error for url {0}: {1}")]
     Other(String, String),
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
 }
 
 pub type TrackId = String;
@@ -43,8 +55,8 @@ pub type TrackId = String;
 #[derive(Debug, Clone)]
 pub struct Track {
     pub id: TrackId,
-    pub track: String,
-    pub artist: String,
+    pub title: String,
+    pub artist: Vec<String>,
     pub webpage_url: Url,
     pub duration: Duration,
     pub path: Utf8PathBuf,
@@ -53,21 +65,21 @@ pub struct Track {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrackUrl(Url);
 
-type RequestRx = async_channel::Receiver<RequestEnvelope>;
-type RequestTx = async_channel::Sender<RequestEnvelope>;
+type RequestRx = mpsc::Receiver<RequestEnvelope>;
+type RequestTx = mpsc::Sender<RequestEnvelope>;
 type ResponseTx = oneshot::Sender<Result<Response>>;
 type StartupTx = oneshot::Sender<AnyResult<()>>;
 
 #[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/src/youtube_dl"]
+#[folder = "$CARGO_MANIFEST_DIR/src/py"]
 #[include = "*.py"]
 struct PythonFiles;
 
 #[derive(FromPyObject)]
 struct TrackRaw {
     track_id: String,
-    track: String,
-    artist: String,
+    title: String,
+    artist: Vec<String>,
     webpage_url: String,
     duration_s: u64,
     path: String,
@@ -101,17 +113,11 @@ struct Worker<'a> {
 }
 
 impl Youtube {
-    pub async fn new(download_dir: &Utf8Path, jobs: usize) -> AnyResult<Self> {
-        let (tx, rx) = async_channel::unbounded();
-
-        for id in 1..=jobs {
-            let rx = rx.clone();
-            let download_dir = download_dir.to_owned();
-            let (stx, srx) = oneshot::channel();
-            thread::spawn(move || Worker::run(stx, id, &rx, &download_dir));
-            srx.await??;
-        }
-
+    pub async fn new(download_dir: Utf8PathBuf) -> AnyResult<Self> {
+        let (tx, rx) = mpsc::channel(1);
+        let (stx, srx) = oneshot::channel();
+        thread::spawn(move || Worker::run(stx, rx, &download_dir));
+        srx.await??;
         Ok(Self { tx })
     }
 
@@ -120,7 +126,7 @@ impl Youtube {
             let host = url
                 .host_str()
                 .ok_or_else(|| Error::InvalidUrl(url.clone()))?;
-            if YOUTUBE_HOSTS.iter().all(|&x| x != host) {
+            if HOSTS.iter().all(|&x| x != host) {
                 return Err(Error::InvalidUrl(url.clone()));
             }
         }
@@ -132,11 +138,7 @@ impl Youtube {
     }
 
     pub async fn download_by_id(&self, id: &str) -> Result<Utf8PathBuf> {
-        self.download_url(make_youtube_url(id)).await
-    }
-
-    async fn download_url(&self, track: Url) -> Result<Utf8PathBuf> {
-        self.request(Request::Download(track))
+        self.request(Request::Download(make_youtube_url(id)))
             .await
             .map(|x| match x {
                 Response::Download(x) => x,
@@ -149,15 +151,15 @@ impl Youtube {
         self.tx
             .send(RequestEnvelope { tx, payload })
             .await
-            .map_err(|_| Error::Channel)?;
-        rx.await.map_err(|_| Error::Channel)?
+            .map_err(|_| ChannelError)?;
+        rx.await.map_err(|_| ChannelError)?
     }
 }
 
 impl<'a> Worker<'a> {
-    fn serve_forever(self, rx: &RequestRx) {
+    fn serve_forever(self, mut rx: RequestRx) {
         loop {
-            let Ok(RequestEnvelope { tx, payload }) = rx.recv_blocking() else {
+            let Some(RequestEnvelope { tx, payload }) = rx.blocking_recv() else {
                 return;
             };
             tx.send(self.request_handler(payload)).ok();
@@ -171,7 +173,7 @@ impl<'a> Worker<'a> {
                 let tracks = self
                     .server
                     .call_method1(
-                        intern!(self.py, "resolve"),
+                        intern!(self.py, PYTHON_RESOLVE_METHOD),
                         (urls.into_iter().map(|x| x.to_string()).collect_vec(),),
                     )
                     .map_err(|e| self.map_err(&e))
@@ -182,7 +184,7 @@ impl<'a> Worker<'a> {
                 tracing::info!(url = ?url, "downloading youtube video");
                 let path = self
                     .server
-                    .call_method1(intern!(self.py, "download"), (url.to_string(),))
+                    .call_method1(intern!(self.py, PYTHON_DOWNLOAD_METHOD), (url.to_string(),))
                     .map_err(|e| self.map_err(&e))
                     .map(Self::map_download)?;
                 Response::Download(path)
@@ -209,7 +211,7 @@ impl<'a> Worker<'a> {
 }
 
 impl Worker<'_> {
-    fn run(stx: StartupTx, id: usize, rx: &RequestRx, download_dir: &Utf8Path) {
+    fn run(stx: StartupTx, rx: RequestRx, download_dir: &Utf8Path) {
         Python::with_gil(|py| {
             let server = match Self::load_python_code(py, download_dir) {
                 Ok(x) => x,
@@ -221,14 +223,13 @@ impl Worker<'_> {
             let worker = Worker { py, server };
             stx.send(Ok(())).unwrap();
             worker.serve_forever(rx);
-            server.call_method0(intern!(py, "close")).ok();
-            tracing::info!("downloader {id} finished");
+            server.call_method0(intern!(py, PYTHON_CLOSE_METHOD)).ok();
         });
     }
 
     fn load_python_code<'b>(py: Python<'b>, download_dir: &Utf8Path) -> PyResult<&'b PyAny> {
-        let module = PyModule::from_code(py, &SERVER_CODE, "server.py", "server").unwrap();
-        let server_class = module.getattr(intern!(py, "Server")).unwrap();
+        let module = PyModule::from_code(py, &PYTHON_CODE, PYTHON_FILE, PYTHON_MODULE).unwrap();
+        let server_class = module.getattr(intern!(py, PYTHON_CLASS)).unwrap();
         let server = server_class.call1((download_dir.as_str(),))?;
         Ok(server)
     }
@@ -238,7 +239,14 @@ impl From<ErrorRaw> for Error {
     fn from(value: ErrorRaw) -> Self {
         match value.kind {
             0 => Self::UnknownObject(value.url),
-            1 => Self::Other(value.url, value.message.unwrap()),
+            1 => {
+                let message = value.message.unwrap();
+                let message = ERROR_PATTERN
+                    .captures(&message)
+                    .and_then(|c| c.get(1).map(|x| x.as_str().to_owned()))
+                    .unwrap_or(message);
+                Self::Other(value.url, message)
+            }
             _ => unreachable!(),
         }
     }
@@ -248,7 +256,7 @@ impl From<TrackRaw> for Track {
     fn from(value: TrackRaw) -> Self {
         Self {
             id: value.track_id,
-            track: value.track,
+            title: value.title,
             artist: value.artist,
             webpage_url: value.webpage_url.parse().unwrap(),
             duration: Duration::from_secs(value.duration_s),
@@ -258,7 +266,7 @@ impl From<TrackRaw> for Track {
 }
 
 fn make_youtube_url(id: &str) -> Url {
-    let mut result = YOUTUBE_URL.clone();
+    let mut result = BASE_URL.clone();
     {
         let mut query = result.query_pairs_mut();
         query.append_pair("v", id);

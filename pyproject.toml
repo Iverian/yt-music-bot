@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "yt-music-bot"
+version = "0.1.0"
+description = ""
+authors = []
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+yt-dlp = "^2023.11.16"
+
+[tool.pylint.messages_control]
+disable = [
+  "missing-function-docstring",
+  "missing-class-docstring",
+  "missing-module-docstring",
+  "invalid-name",
+  "no-member",
+  "no-name-in-module",
+  "too-few-public-methods",
+  "undefined-loop-variable",
+  "too-many-arguments",
+  "unused-import",
+  "import-error",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

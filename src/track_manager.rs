@@ -1,22 +1,22 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use anyhow::Result as AnyResult;
 use camino::Utf8PathBuf;
 use tokio::sync::{mpsc, Mutex};
 
+use crate::player::OriginId;
+use crate::util::channel::ChannelResult;
 use crate::youtube::{Error as YoutubeError, TrackId, Youtube};
 
-const MAX_TRACKS: usize = 5; // TODO: extract into settings
-
 #[derive(Debug)]
-pub struct Manager {
+pub struct TrackManager {
     tx: RequestTx,
 }
 
 #[derive(Debug, Clone)]
 pub enum Event {
     Acquired {
+        origin_id: OriginId,
         id: TrackId,
         err: Option<YoutubeError>,
     },
@@ -28,8 +28,8 @@ pub enum Event {
 #[derive(Debug)]
 pub struct Receiver(EventRx);
 
-type RequestTx = async_channel::Sender<Request>;
-type RequestRx = async_channel::Receiver<Request>;
+type RequestTx = mpsc::UnboundedSender<Request>;
+type RequestRx = mpsc::UnboundedReceiver<Request>;
 type EventTx = mpsc::UnboundedSender<Event>;
 type EventRx = mpsc::UnboundedReceiver<Event>;
 
@@ -37,8 +37,9 @@ struct Worker {
     tx: EventTx,
     downloader: Youtube,
     state: HashMap<TrackId, TrackLock>,
-    queue: VecDeque<TrackId>,
+    queue: VecDeque<(OriginId, TrackId)>,
     tracks: usize,
+    cache_size: usize,
 }
 
 type TrackLock = Arc<Mutex<TrackState>>;
@@ -50,14 +51,14 @@ struct TrackState {
 
 #[derive(Debug)]
 enum Request {
-    Claim { id: TrackId },
+    Claim { origin_id: OriginId, id: TrackId },
     Unclaim { id: TrackId },
     Clear,
 }
 
-impl Manager {
-    pub fn new(downloader: Youtube) -> (Manager, Receiver) {
-        let (tx, rx) = async_channel::unbounded();
+impl TrackManager {
+    pub fn new(downloader: Youtube, cache_size: usize) -> (TrackManager, Receiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
         let (etx, erx) = mpsc::unbounded_channel();
         let w = Worker {
             tx: etx,
@@ -65,36 +66,31 @@ impl Manager {
             state: HashMap::new(),
             queue: VecDeque::new(),
             tracks: 0,
+            cache_size: 1 + cache_size,
         };
         tokio::task::spawn(w.serve_forever(rx));
         (Self { tx }, Receiver(erx))
     }
 
-    pub async fn claim(&self, id: TrackId) -> AnyResult<()> {
-        self.tx.send(Request::Claim { id }).await?;
+    pub fn claim(&self, origin_id: OriginId, id: TrackId) -> ChannelResult<()> {
+        self.tx.send(Request::Claim { origin_id, id })?;
         Ok(())
     }
 
-    pub async fn unclaim(&self, id: TrackId) -> AnyResult<()> {
-        self.tx.send(Request::Unclaim { id }).await?;
+    pub fn unclaim(&self, id: TrackId) -> ChannelResult<()> {
+        self.tx.send(Request::Unclaim { id })?;
         Ok(())
     }
 
-    pub async fn clear(&self) -> AnyResult<()> {
-        self.tx.send(Request::Clear).await?;
+    pub fn clear(&self) -> ChannelResult<()> {
+        self.tx.send(Request::Clear)?;
         Ok(())
-    }
-}
-
-impl Drop for Manager {
-    fn drop(&mut self) {
-        self.tx.close();
     }
 }
 
 impl Worker {
-    async fn serve_forever(mut self, rx: RequestRx) {
-        while let Ok(req) = rx.recv().await {
+    async fn serve_forever(mut self, mut rx: RequestRx) {
+        while let Some(req) = rx.recv().await {
             self.request_handler(req).await;
         }
     }
@@ -102,35 +98,41 @@ impl Worker {
     async fn request_handler(&mut self, req: Request) {
         tracing::debug!(request = ?req, "track manager request");
         match req {
-            Request::Claim { id } => self.claim(id).await,
+            Request::Claim { origin_id, id } => self.claim(origin_id, id).await,
             Request::Unclaim { id } => self.unclaim(id).await,
             Request::Clear => self.clear().await,
         }
     }
 
-    async fn claim(&mut self, id: TrackId) {
+    async fn claim(&mut self, origin_id: OriginId, id: TrackId) {
         if let Some(lock) = self.state.get(&id) {
             let mut state = lock.lock().await;
             state.claim();
             if state.needs_download() {
-                if self.tracks >= MAX_TRACKS {
-                    self.queue.push_back(id);
+                if self.tracks >= self.cache_size {
+                    self.queue.push_back((origin_id, id));
                 } else {
                     self.tracks += 1;
-                    self.download(id, lock.clone());
+                    self.download(origin_id, id, lock.clone());
                 }
             } else if state.present() {
-                self.tx.send(Event::Acquired { id, err: None }).ok();
+                self.tx
+                    .send(Event::Acquired {
+                        origin_id,
+                        id,
+                        err: None,
+                    })
+                    .ok();
             }
         } else {
             let lock = TrackState::new_lock(1);
-            if self.tracks >= MAX_TRACKS {
+            if self.tracks >= self.cache_size {
                 self.state.insert(id.clone(), lock);
-                self.queue.push_back(id);
+                self.queue.push_back((origin_id, id));
             } else {
                 self.tracks += 1;
                 self.state.insert(id.clone(), lock.clone());
-                self.download(id, lock);
+                self.download(origin_id, id, lock);
             }
         }
     }
@@ -149,9 +151,9 @@ impl Worker {
         self.tx.send(Event::Removed { id }).ok();
         state.remove().await;
 
-        if let Some(id) = self.queue.pop_front() {
+        if let Some((origin_id, id)) = self.queue.pop_front() {
             let lock = self.state[&id].clone();
-            self.download(id, lock);
+            self.download(origin_id, id, lock);
         } else {
             self.tracks -= 1;
         }
@@ -165,19 +167,29 @@ impl Worker {
         self.state.clear();
     }
 
-    fn download(&self, id: TrackId, lock: TrackLock) {
+    fn download(&self, origin_id: OriginId, id: TrackId, lock: TrackLock) {
         let tx = self.tx.clone();
         let downloader = self.downloader.clone();
         tokio::task::spawn(async move {
             let path = match downloader.download_by_id(&id).await {
                 Ok(x) => x,
                 Err(e) => {
-                    tx.send(Event::Acquired { id, err: Some(e) }).ok();
+                    tx.send(Event::Acquired {
+                        origin_id,
+                        id,
+                        err: Some(e),
+                    })
+                    .ok();
                     return;
                 }
             };
             if lock.lock().await.try_set_path(path).await {
-                tx.send(Event::Acquired { id, err: None }).ok();
+                tx.send(Event::Acquired {
+                    origin_id,
+                    id,
+                    err: None,
+                })
+                .ok();
             }
         });
     }

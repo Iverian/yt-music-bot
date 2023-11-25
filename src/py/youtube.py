@@ -1,3 +1,5 @@
+import functools
+import signal
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional
 
@@ -23,29 +25,33 @@ YOUTUBE_DL_PARAMS = {
     "default_search": "auto",
     "source_address": "0.0.0.0",
     "consoletitle": False,
+    "color": "never",
+    "socket_timeout": 15,  # TODO: extract to config
 }
+YOUTUBE_DOWNLOAD_TIMEOUT_MSG = "Download timed out"
+
 E_UNKNOWN_OBJECT = 0
 E_OTHER = 1
+
+Params = Mapping[str, Any]
 
 
 @dataclass
 class Track:
     track_id: str
-    track: str
-    artist: str
+    title: str
+    artist: List[str]
     webpage_url: str
     duration_s: int
     path: str
 
 
-class Server:
+class Youtube:
     _yt: YoutubeDL
 
-    def __init__(self, download_dir: str) -> None:
-        final_params = YOUTUBE_DL_PARAMS.copy()
-        final_params["outtmpl"] = f"{download_dir}/{YOUTUBE_DL_OUTPUT_TEMPLATE}"
-
-        self._yt = YoutubeDL(final_params)
+    def __init__(self, download_dir: str, download_timeout_s: int = 30) -> None:
+        self._yt = YoutubeDL(self._make_params(download_dir))
+        self._download_timeout_s = download_timeout_s
 
     def close(self):
         self._yt.close()
@@ -64,14 +70,19 @@ class Server:
 
     def download(self, url: str) -> str:
         try:
-            data = self._yt.extract_info(url, download=True)
-            if not isinstance(data, dict):
-                raise Error.unknown_object(url)
-            return str(self._yt.prepare_filename(data))
+            return timeout(self._download_timeout_s, YOUTUBE_DOWNLOAD_TIMEOUT_MSG)(
+                self._download_impl
+            )(url)
         except Error:
             raise
         except Exception as e:
             raise Error.other(url, e) from e
+
+    def _download_impl(self, url: str) -> str:
+        data = self._yt.extract_info(url, download=True)
+        if not isinstance(data, dict):
+            raise Error.unknown_object(url)
+        return str(self._yt.prepare_filename(data))
 
     def _resolve_url(self, url: str) -> List[Track]:
         result = None
@@ -90,14 +101,30 @@ class Server:
         return result
 
     def _get_track(self, data: Mapping[str, Any]) -> Track:
+        title = None
+        artist = []
+        if "track" in data and "artist" in data:
+            title = str(data["track"])
+            # В некоторых треках Youtube отдает список артистов через запятую
+            artist = [i.strip() for i in str(data["artist"]).split(",")]
+        else:
+            title = str(data["title"])
+
         return Track(
             track_id=str(data["id"]),
-            track=str(_coalesce(data, "track", "title")),
-            artist=str(_coalesce(data, "artist", "channel")),
+            title=title,
+            artist=artist,
             webpage_url=str(data["webpage_url"]),
             duration_s=int(data["duration"]),
             path=str(self._yt.prepare_filename(data)),
         )
+
+    @staticmethod
+    def _make_params(download_dir: str) -> Params:
+        params = YOUTUBE_DL_PARAMS.copy()
+        params["cachedir"] = download_dir
+        params["outtmpl"] = f"{download_dir}/{YOUTUBE_DL_OUTPUT_TEMPLATE}"
+        return params
 
 
 class Error(Exception):
@@ -119,9 +146,21 @@ class Error(Exception):
         return Error(E_OTHER, url, str(cause))
 
 
-def _coalesce(obj: Mapping[str, Any], *keys: str):
-    for k in keys:
-        v = obj.get(k, None)
-        if v:
-            return v
-    raise KeyError(keys[-1])
+def timeout(seconds: int, error_message: str):
+    def decorator(func):
+        def _handle_timeout(signum, frame):
+            raise TimeoutError(error_message)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                signal.alarm(0)
+            return result
+
+        return wrapper
+
+    return decorator

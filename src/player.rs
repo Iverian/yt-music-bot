@@ -7,10 +7,14 @@ use camino::Utf8PathBuf;
 use rodio::source::EmptyCallback;
 use rodio::{Decoder, OutputStream, Sink};
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-pub type EventTx = async_channel::Sender<Event>;
-pub type EventRx = async_channel::Receiver<Event>;
+use crate::util::channel::ChannelError;
+
+pub const MAX_VOLUME: u8 = 10;
+
+pub type EventTx = mpsc::UnboundedSender<Event>;
+pub type EventRx = mpsc::UnboundedReceiver<Event>;
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -23,28 +27,40 @@ pub struct Receiver(EventRx);
 
 #[derive(Debug, Clone, Error)]
 pub enum Error {
-    #[error("error sending or receiving")]
-    Channel,
     #[error("player queue is empty")]
     QueueEmpty,
     #[error("unable to open track")]
     InvalidTrack,
+    #[error("invalid volume level, expected value from 0 to 10")]
+    InvalidVolumeLevel,
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Event {
+pub struct Event {
+    pub origin_id: OriginId,
+    pub kind: EventKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EventKind {
     PlaybackStarted,
     PlaybackPaused,
     PlaybackStopped,
+    Muted,
+    Unmuted,
+    Volume(u8),
     TrackAdded(QueueId),
     TrackStarted(QueueId),
     TrackFinished(QueueId),
 }
 
+pub type OriginId = usize;
 pub type QueueId = usize;
 
-type RequestTx = async_channel::Sender<RequestEnvelope>;
-type RequestRx = async_channel::Receiver<RequestEnvelope>;
+type RequestTx = mpsc::UnboundedSender<RequestEnvelope>;
+type RequestRx = mpsc::UnboundedReceiver<RequestEnvelope>;
 type ResponseTx = oneshot::Sender<Result<()>>;
 type StartupTx = oneshot::Sender<AnyResult<()>>;
 type OpenTrack = Decoder<BufReader<File>>;
@@ -52,6 +68,7 @@ type Callback = EmptyCallback<f32>;
 
 struct RequestEnvelope {
     tx: ResponseTx,
+    origin_id: OriginId,
     payload: Request,
 }
 
@@ -62,77 +79,107 @@ enum Request {
     PlayToggle,
     Stop,
     Skip,
+    Mute,
+    Unmute,
+    MuteToggle,
+    GetVolume,
+    IncreaseVolume,
+    DecreaseVolume,
+    SetVolume { level: u8 },
     Queue { id: QueueId, path: Utf8PathBuf },
 }
 
 struct Worker {
     sink: Sink,
     tx: EventTx,
+    volume_level: u8,
+    muted: bool,
 }
 
 impl Player {
     pub async fn new() -> AnyResult<(Self, Receiver)> {
-        let (tx, rx) = async_channel::unbounded();
-        let (etx, erx) = async_channel::unbounded();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (etx, erx) = mpsc::unbounded_channel();
         let (stx, srx) = oneshot::channel();
-        thread::spawn(move || Worker::run(stx, etx, &rx));
+        thread::spawn(move || Worker::run(stx, etx, rx));
         srx.await??;
         Ok((Self { tx }, Receiver(erx)))
     }
 
-    pub async fn play(&self) -> Result<()> {
-        self.request(Request::Play).await
+    pub async fn play(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::Play).await
     }
 
-    pub async fn pause(&self) -> Result<()> {
-        self.request(Request::Pause).await
+    pub async fn pause(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::Pause).await
     }
 
-    pub async fn play_toggle(&self) -> Result<()> {
-        self.request(Request::PlayToggle).await
+    pub async fn play_toggle(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::PlayToggle).await
     }
 
-    pub async fn stop(&self) -> Result<()> {
-        self.request(Request::Stop).await
+    pub async fn stop(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::Stop).await
     }
 
-    pub async fn skip(&self) -> Result<()> {
-        self.request(Request::Skip).await
+    pub async fn skip(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::Skip).await
     }
 
-    pub async fn queue(&self, id: QueueId, path: Utf8PathBuf) -> Result<QueueId> {
-        self.request(Request::Queue { id, path }).await?;
-        Ok(id)
+    pub async fn mute(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::Mute).await
     }
 
-    async fn request(&self, payload: Request) -> Result<()> {
+    pub async fn unmute(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::Unmute).await
+    }
+
+    pub async fn mute_toggle(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::MuteToggle).await
+    }
+
+    pub async fn get_volume(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::GetVolume).await
+    }
+
+    pub async fn set_volume(&self, origin_id: OriginId, level: u8) -> Result<()> {
+        self.request(origin_id, Request::SetVolume { level }).await
+    }
+
+    pub async fn increase_volume(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::IncreaseVolume).await
+    }
+
+    pub async fn decrease_volume(&self, origin_id: OriginId) -> Result<()> {
+        self.request(origin_id, Request::DecreaseVolume).await
+    }
+
+    pub async fn queue(&self, origin_id: OriginId, id: QueueId, path: Utf8PathBuf) -> Result<()> {
+        self.request(origin_id, Request::Queue { id, path }).await
+    }
+
+    async fn request(&self, origin_id: OriginId, payload: Request) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(RequestEnvelope { tx, payload })
-            .await
-            .map_err(|_| Error::Channel)?;
-        rx.await.map_err(|_| Error::Channel)?
-    }
-}
-
-impl Drop for Player {
-    fn drop(&mut self) {
-        tracing::info!("drop player");
-        self.tx.close();
+            .send(RequestEnvelope {
+                tx,
+                origin_id,
+                payload,
+            })
+            .map_err(|_| ChannelError)?;
+        rx.await.map_err(|_| ChannelError)??;
+        Ok(())
     }
 }
 
 impl Receiver {
-    pub async fn recv(&self) -> Option<Event> {
-        match self.0.recv().await {
-            Ok(x) => Some(x),
-            Err(_) => None,
-        }
+    pub async fn recv(&mut self) -> Option<Event> {
+        self.0.recv().await
     }
 }
 
 impl Worker {
-    fn run(stx: StartupTx, tx: EventTx, rx: &RequestRx) {
+    fn run(stx: StartupTx, tx: EventTx, rx: RequestRx) {
         let (_stream, sink) = match Self::init() {
             Ok(x) => x,
             Err(e) => {
@@ -140,7 +187,12 @@ impl Worker {
                 return;
             }
         };
-        let worker = Worker { sink, tx };
+        let worker = Worker {
+            sink,
+            tx,
+            volume_level: 10u8,
+            muted: false,
+        };
         stx.send(Ok(())).unwrap();
         worker.serve_forever(rx);
         tracing::info!("player finished");
@@ -153,76 +205,176 @@ impl Worker {
         Ok((stream, sink))
     }
 
-    fn serve_forever(&self, rx: &RequestRx) {
+    fn serve_forever(mut self, mut rx: RequestRx) {
         loop {
-            let Ok(RequestEnvelope { tx, payload }) = rx.recv_blocking() else {
+            let Some(RequestEnvelope { tx, origin_id, payload }) = rx.blocking_recv() else {
                 return;
             };
             tracing::info!(request=?payload, "player request");
-            tx.send(self.request_handler(payload)).ok();
+            tx.send(self.request_handler(origin_id, payload)).ok();
         }
     }
 
-    fn request_handler(&self, payload: Request) -> Result<()> {
+    fn request_handler(&mut self, origin_id: OriginId, payload: Request) -> Result<()> {
         match payload {
-            Request::Play => {
-                if self.sink.empty() {
-                    return Err(Error::QueueEmpty);
-                }
-                if self.sink.is_paused() {
-                    self.send(Event::PlaybackStarted);
-                }
-                self.sink.play();
-            }
-            Request::Pause => {
-                if self.sink.empty() {
-                    return Err(Error::QueueEmpty);
-                }
-                if !self.sink.is_paused() {
-                    self.send(Event::PlaybackPaused);
-                }
-                self.sink.pause();
-            }
-            Request::PlayToggle => {
-                if self.sink.empty() {
-                    return Err(Error::QueueEmpty);
-                }
-                if self.sink.is_paused() {
-                    self.send(Event::PlaybackStarted);
-                    self.sink.play();
-                } else {
-                    self.send(Event::PlaybackPaused);
-                    self.sink.pause();
-                }
-            }
+            Request::Play => self.play_handler(origin_id),
+            Request::Pause => self.pause_handler(origin_id),
+            Request::PlayToggle => self.play_toggle_handler(origin_id),
             Request::Stop => {
-                if !self.sink.empty() {
-                    self.send(Event::PlaybackStopped);
-                }
-                self.sink.clear();
+                self.stop_handler(origin_id);
+                Ok(())
             }
-            Request::Skip => {
-                if self.sink.empty() {
-                    return Err(Error::QueueEmpty);
-                }
-                self.sink.skip_one();
+            Request::Skip => self.skip_handler(),
+            Request::Mute => {
+                self.mute_handler(origin_id);
+                Ok(())
             }
-            Request::Queue { id, path } => {
-                let track = open_track(path).map_err(|_| Error::InvalidTrack)?;
-                self.send(Event::TrackAdded(id));
-                if !self.sink.is_paused() && self.sink.empty() {
-                    self.send(Event::PlaybackStarted);
-                }
-                self.sink.append(cb_track_started(self.tx.clone(), id));
-                self.sink.append(track);
-                self.sink.append(cb_track_finished(self.tx.clone(), id));
+            Request::Unmute => {
+                self.unmute_handler(origin_id);
+                Ok(())
             }
-        };
+            Request::MuteToggle => {
+                self.mute_toggle_handler(origin_id);
+                Ok(())
+            }
+            Request::GetVolume => {
+                self.get_volume(origin_id);
+                Ok(())
+            }
+            Request::SetVolume { level } => self.set_volume_handler(origin_id, level),
+            Request::IncreaseVolume => {
+                self.change_volume_handler(origin_id, 1);
+                Ok(())
+            }
+            Request::DecreaseVolume => {
+                self.change_volume_handler(origin_id, -1);
+                Ok(())
+            }
+            Request::Queue { id, path } => self.queue_handler(origin_id, path, id),
+        }
+    }
+
+    fn queue_handler(&mut self, origin_id: OriginId, path: Utf8PathBuf, id: usize) -> Result<()> {
+        let track = open_track(path).map_err(|_| Error::InvalidTrack)?;
+        self.send(origin_id, EventKind::TrackAdded(id));
+        if !self.sink.is_paused() && self.sink.empty() {
+            self.send(origin_id, EventKind::PlaybackStarted);
+        }
+        self.sink
+            .append(cb_track_started(self.tx.clone(), origin_id, id));
+        self.sink.append(track);
+        self.sink
+            .append(cb_track_finished(self.tx.clone(), origin_id, id));
         Ok(())
     }
 
-    fn send(&self, e: Event) {
-        self.tx.send_blocking(e).unwrap();
+    fn change_volume_handler(&mut self, origin_id: OriginId, modifier: i8) {
+        self.volume_level = change_level(self.volume_level, modifier);
+        self.send(origin_id, EventKind::Volume(self.volume_level));
+        if !self.muted {
+            self.sink.set_volume(level_to_volume(self.volume_level));
+        }
+    }
+
+    fn set_volume_handler(&mut self, origin_id: OriginId, level: u8) -> Result<()> {
+        if level > MAX_VOLUME {
+            return Err(Error::InvalidVolumeLevel);
+        }
+        self.volume_level = level;
+        self.send(origin_id, EventKind::Volume(self.volume_level));
+        if !self.muted {
+            self.sink.set_volume(level_to_volume(self.volume_level));
+        }
+        Ok(())
+    }
+
+    fn get_volume(&mut self, origin_id: OriginId) {
+        self.send(origin_id, EventKind::Volume(self.volume_level));
+    }
+
+    fn mute_toggle_handler(&mut self, origin_id: OriginId) {
+        if self.muted {
+            self.send(origin_id, EventKind::Unmuted);
+            self.muted = false;
+            self.sink.set_volume(level_to_volume(self.volume_level));
+        } else {
+            self.send(origin_id, EventKind::Muted);
+            self.muted = true;
+            self.sink.set_volume(0.);
+        }
+    }
+
+    fn unmute_handler(&mut self, origin_id: OriginId) {
+        if !self.muted {
+            return;
+        }
+        self.send(origin_id, EventKind::Unmuted);
+        self.muted = false;
+        self.sink.set_volume(level_to_volume(self.volume_level));
+    }
+
+    fn mute_handler(&mut self, origin_id: OriginId) {
+        if self.muted {
+            return;
+        }
+        self.send(origin_id, EventKind::Muted);
+        self.muted = true;
+        self.sink.set_volume(0.);
+    }
+
+    fn skip_handler(&mut self) -> Result<()> {
+        if self.sink.empty() {
+            return Err(Error::QueueEmpty);
+        }
+        self.sink.skip_one();
+        Ok(())
+    }
+
+    fn stop_handler(&mut self, origin_id: OriginId) {
+        if !self.sink.empty() {
+            self.send(origin_id, EventKind::PlaybackStopped);
+        }
+        self.sink.clear();
+    }
+
+    fn play_toggle_handler(&mut self, origin_id: OriginId) -> Result<()> {
+        if self.sink.empty() {
+            return Err(Error::QueueEmpty);
+        }
+        if self.sink.is_paused() {
+            self.send(origin_id, EventKind::PlaybackStarted);
+            self.sink.play();
+        } else {
+            self.send(origin_id, EventKind::PlaybackPaused);
+            self.sink.pause();
+        }
+        Ok(())
+    }
+
+    fn pause_handler(&mut self, origin_id: OriginId) -> Result<()> {
+        if self.sink.empty() {
+            return Err(Error::QueueEmpty);
+        }
+        if !self.sink.is_paused() {
+            self.send(origin_id, EventKind::PlaybackPaused);
+        }
+        self.sink.pause();
+        Ok(())
+    }
+
+    fn play_handler(&mut self, origin_id: OriginId) -> Result<()> {
+        if self.sink.empty() {
+            return Err(Error::QueueEmpty);
+        }
+        if self.sink.is_paused() {
+            self.send(origin_id, EventKind::PlaybackStarted);
+        }
+        self.sink.play();
+        Ok(())
+    }
+
+    fn send(&self, origin_id: OriginId, e: EventKind) {
+        self.tx.send(Event { origin_id, kind: e }).unwrap();
     }
 }
 
@@ -230,15 +382,23 @@ fn open_track(path: Utf8PathBuf) -> AnyResult<OpenTrack> {
     Ok(Decoder::new(BufReader::new(File::open(path)?))?)
 }
 
-fn cb_track_started(tx: EventTx, id: QueueId) -> Callback {
+fn cb_track_started(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
     cb_source(move || {
-        tx.send_blocking(Event::TrackStarted(id)).ok();
+        tx.send(Event {
+            origin_id,
+            kind: EventKind::TrackStarted(id),
+        })
+        .ok();
     })
 }
 
-fn cb_track_finished(tx: EventTx, id: QueueId) -> Callback {
+fn cb_track_finished(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
     cb_source(move || {
-        tx.send_blocking(Event::TrackFinished(id)).ok();
+        tx.send(Event {
+            origin_id,
+            kind: EventKind::TrackFinished(id),
+        })
+        .ok();
     })
 }
 
@@ -247,4 +407,15 @@ where
     F: Fn() + Send + 'static,
 {
     EmptyCallback::new(Box::new(f))
+}
+
+fn level_to_volume(level: u8) -> f32 {
+    f32::from(level) / 10.
+}
+
+fn change_level(level: u8, modifier: i8) -> u8 {
+    if (level == 0 && modifier < 0) || (level == MAX_VOLUME && modifier > 0) {
+        return level;
+    }
+    level.wrapping_add_signed(modifier)
 }

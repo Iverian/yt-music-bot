@@ -9,38 +9,54 @@ mod util;
 mod youtube;
 
 use anyhow::Result as AnyResult;
+use camino::Utf8PathBuf;
 use dotenvy::dotenv;
 use mimalloc::MiMalloc;
 
 use crate::cli::Cli;
-use crate::controller::Controller;
+use crate::controller::{Controller, Settings as ControllerSettings};
 use crate::player::Player;
 use crate::server::Server;
-use crate::util::{make_cancel_token, run_tasks};
+use crate::util::cancel::{make_cancel_token, run_tasks};
+use crate::util::temp_dir::TempDir;
 use crate::youtube::Youtube;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 async fn run(cli: Cli) -> AnyResult<()> {
-    tokio::fs::create_dir_all(&cli.download_dir).await?;
+    let controller_settings = cli.controller_settings();
+    let dir = TempDir::new(cli.download_dir).await?;
 
+    let r = run_inner(
+        cli.unix_socket_path,
+        dir.path().to_owned(),
+        controller_settings,
+    )
+    .await;
+
+    dir.close().await;
+    r
+}
+
+async fn run_inner(
+    unix_socket_path: Utf8PathBuf,
+    download_dir: Utf8PathBuf,
+    controller_settings: ControllerSettings,
+) -> AnyResult<()> {
     let token = make_cancel_token().await;
 
-    let (player, rx) = Player::new().await?;
-    let youtube = Youtube::new(
-        &cli.download_dir.canonicalize_utf8()?,
-        cli.yt_download_threads,
-    )
-    .await?;
+    let (player, player_receiver) = Player::new().await?;
+    let youtube = Youtube::new(download_dir).await?;
 
-    let (controller, controller_handle) =
-        Controller::new(token.child_token(), player, rx, youtube, true);
-    let server_handle = Server::spawn(
+    let (controller, controller_handle) = Controller::new(
         token.child_token(),
-        controller,
-        cli.unix_socket_path.clone(),
-    )?;
+        player,
+        player_receiver,
+        youtube,
+        controller_settings,
+    );
+    let server_handle = Server::spawn(token.child_token(), controller, unix_socket_path)?;
 
     run_tasks(vec![controller_handle, server_handle], token).await
 }

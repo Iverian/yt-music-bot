@@ -3,30 +3,57 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result as AnyResult;
-use atomic_counter::{AtomicCounter, ConsistentCounter};
+use atomic_counter::{AtomicCounter, ConsistentCounter, RelaxedCounter};
 use itertools::Itertools;
+use thiserror::Error;
 use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::player::{
-    Event as PlayerEvent, Player, QueueId, Receiver as PlayerReceiver, Result as PlayerResult,
+    Event as PlayerEvent, EventKind as PlayerEventKind, OriginId, Player, QueueId,
+    Receiver as PlayerReceiver, Result as PlayerResult,
 };
-use crate::track_manager::{Event as ManagerEvent, Manager, Receiver as ManagerReceiver};
-use crate::util::Handle;
+use crate::track_manager::{Event as ManagerEvent, Receiver as ManagerReceiver, TrackManager};
+use crate::util::cancel::Handle;
+use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track, TrackId, Youtube};
 
-const CONTROLLER_QSIZE: usize = 8;
+const BROADCAST_QUEUE_SIZE: usize = 8;
+
+pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 pub struct Controller {
     tx: EventTx,
-    yt: Youtube,
     state: Arc<State>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Sender {
+    origin_id: OriginId,
+    state: Arc<State>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    pub auto_play: bool,
+    pub track_cache_size: usize,
+}
+
+#[derive(Debug, Clone, Error)]
+pub enum Error {
+    #[error(transparent)]
+    Youtube(#[from] YoutubeError),
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
+}
+
 #[derive(Debug)]
-pub struct Receiver(EventRx);
+pub struct Receiver {
+    origin_id: OriginId,
+    rx: EventRx,
+}
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -34,8 +61,12 @@ pub enum Event {
     PlaybackPaused,
     PlaybackStopped,
     QueueFinished,
+    WaitingForDownload,
+    Muted,
+    Unmuted,
+    Volume { level: u8 },
     NowPlaying { queue_id: QueueId, track: Track },
-    DownloadError { err: YoutubeError },
+    DownloadError { track: Track, err: YoutubeError },
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +80,8 @@ pub struct QueuedTrack {
 pub struct Data {
     pub queue: Map<QueueId, QueueData>,
     pub tracks: Map<TrackId, TrackData>,
-    counter: ConsistentCounter,
+    queue_counter: ConsistentCounter,
+    origin_counter: RelaxedCounter,
     player_queue_size: usize,
     auto_play: bool,
 }
@@ -69,18 +101,29 @@ pub struct TrackData {
 pub struct QueueData {
     pub track_id: TrackId,
     pub ready: bool,
+    origin_id: OriginId,
 }
 
-type EventTx = broadcast::Sender<Event>;
-type EventRx = broadcast::Receiver<Event>;
+type EventTx = broadcast::Sender<EventWrapper>;
+type EventRx = broadcast::Receiver<EventWrapper>;
 type Map<K, V> = BTreeMap<K, V>;
+
+#[derive(Clone)]
+struct EventWrapper {
+    origin_id: Option<OriginId>,
+    event: Event,
+}
 
 #[derive(Debug)]
 struct State {
+    youtube: Youtube,
     player: Player,
-    manager: Manager,
+    manager: TrackManager,
     data: RwLock<Data>,
 }
+
+#[derive(Clone)]
+struct Broadcast(EventTx);
 
 impl Controller {
     pub fn new(
@@ -88,53 +131,98 @@ impl Controller {
         player: Player,
         player_receiver: PlayerReceiver,
         youtube: Youtube,
-        auto_play: bool,
+        settings: Settings,
     ) -> (Self, Handle) {
-        let (tx, _) = broadcast::channel(CONTROLLER_QSIZE);
-        let (manager, manager_receiver) = Manager::new(youtube.clone());
-        let state = State::new(player, manager, auto_play);
+        let (tx, _) = broadcast::channel(BROADCAST_QUEUE_SIZE);
+        let (manager, manager_receiver) =
+            TrackManager::new(youtube.clone(), settings.track_cache_size);
+        let state = State::new(player, manager, youtube, settings.auto_play);
         let handle = tokio::spawn(State::serve_forever(
             state.clone(),
             token,
-            tx.clone(),
+            Broadcast(tx.clone()),
             player_receiver,
             manager_receiver,
         ));
-        let controller = Self {
-            tx,
-            yt: youtube,
-            state,
-        };
+        let controller = Self { tx, state };
 
         (controller, handle)
     }
 
-    pub fn subscribe(&self) -> Receiver {
-        Receiver(self.tx.subscribe())
+    pub async fn subscribe(&self) -> (Sender, Receiver) {
+        let origin_id = self.state.data.write().await.origin_counter.inc();
+        let proxy = Sender {
+            origin_id,
+            state: self.state.clone(),
+        };
+        let receiver = Receiver {
+            origin_id,
+            rx: self.tx.subscribe(),
+        };
+        (proxy, receiver)
     }
+}
 
-    pub async fn queue(&self, urls: Vec<Url>) -> AnyResult<Vec<QueuedTrack>> {
-        self.state.queue(self.yt.resolve(urls).await?).await
+impl Sender {
+    pub async fn queue(&self, urls: Vec<Url>) -> Result<Vec<QueuedTrack>> {
+        let tracks = self
+            .state
+            .youtube
+            .resolve(urls)
+            .await
+            .map_err(|e| match e {
+                YoutubeError::Channel(e) => Error::Channel(e),
+                e => Error::Youtube(e),
+            })?;
+        self.state.queue(self.origin_id, tracks).await
     }
 
     pub async fn play(&self) -> PlayerResult<()> {
-        self.state.player.play().await
+        self.state.player.play(self.origin_id).await
     }
 
     pub async fn pause(&self) -> PlayerResult<()> {
-        self.state.player.pause().await
+        self.state.player.pause(self.origin_id).await
     }
 
     pub async fn play_toggle(&self) -> PlayerResult<()> {
-        self.state.player.play_toggle().await
+        self.state.player.play_toggle(self.origin_id).await
     }
 
     pub async fn stop(&self) -> PlayerResult<()> {
-        self.state.player.stop().await
+        self.state.player.stop(self.origin_id).await
     }
 
     pub async fn skip(&self) -> PlayerResult<()> {
-        self.state.player.skip().await
+        self.state.player.skip(self.origin_id).await
+    }
+
+    pub async fn mute(&self) -> PlayerResult<()> {
+        self.state.player.mute(self.origin_id).await
+    }
+
+    pub async fn unmute(&self) -> PlayerResult<()> {
+        self.state.player.unmute(self.origin_id).await
+    }
+
+    pub async fn mute_toggle(&self) -> PlayerResult<()> {
+        self.state.player.mute_toggle(self.origin_id).await
+    }
+
+    pub async fn get_volume(&self) -> PlayerResult<()> {
+        self.state.player.get_volume(self.origin_id).await
+    }
+
+    pub async fn set_volume(&self, level: u8) -> PlayerResult<()> {
+        self.state.player.set_volume(self.origin_id, level).await
+    }
+
+    pub async fn increase_volume(&self) -> PlayerResult<()> {
+        self.state.player.increase_volume(self.origin_id).await
+    }
+
+    pub async fn decrease_volume(&self) -> PlayerResult<()> {
+        self.state.player.decrease_volume(self.origin_id).await
     }
 
     pub async fn view(&self) -> RwLockReadGuard<'_, Data> {
@@ -142,121 +230,160 @@ impl Controller {
     }
 }
 
+impl Broadcast {
+    fn broadcast(&self, event: Event) -> ChannelResult<()> {
+        self.0.send(EventWrapper {
+            origin_id: None,
+            event,
+        })?;
+        Ok(())
+    }
+
+    fn direct(&self, origin_id: OriginId, event: Event) -> ChannelResult<()> {
+        self.0.send(EventWrapper {
+            origin_id: Some(origin_id),
+            event,
+        })?;
+        Ok(())
+    }
+}
+
 impl Receiver {
     pub async fn recv(&mut self) -> Option<Event> {
-        self.0.recv().await.ok()
+        loop {
+            match self.rx.recv().await {
+                Ok(EventWrapper {
+                    origin_id: Some(id),
+                    event,
+                }) if id == self.origin_id => {
+                    return Some(event);
+                }
+                Ok(EventWrapper {
+                    origin_id: None,
+                    event,
+                }) => {
+                    return Some(event);
+                }
+                Err(_) => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
 impl State {
-    fn new(player: Player, manager: Manager, auto_play: bool) -> Arc<Self> {
+    fn new(player: Player, manager: TrackManager, youtube: Youtube, auto_play: bool) -> Arc<Self> {
         Arc::new(Self {
             player,
             manager,
+            youtube,
             data: RwLock::new(Data::new(auto_play)),
         })
     }
 
-    async fn queue(&self, tracks: Vec<Track>) -> AnyResult<Vec<QueuedTrack>> {
+    async fn queue(&self, origin_id: OriginId, tracks: Vec<Track>) -> Result<Vec<QueuedTrack>> {
         let mut data = self.data.write().await;
-        let result = data.queue(&self.manager, tracks).await?;
+        let result = data.queue(origin_id, &self.manager, tracks)?;
         Ok(result)
     }
 
     async fn serve_forever_impl(
         &self,
         token: CancellationToken,
-        tx: EventTx,
-        prx: PlayerReceiver,
+        tx: Broadcast,
+        mut prx: PlayerReceiver,
         mut mrx: ManagerReceiver,
     ) -> AnyResult<()> {
         loop {
-            let e = tokio::select! {
+            tokio::select! {
                 oe = prx.recv() => {
                     let Some(e) = oe else {
                         break;
                     };
-                    self.handle_player_event(e).await?
+                    self.handle_player_event(&tx, e).await?;
 
                 }
                 oe = mrx.recv() => {
                     let Some(e) = oe else {
                         break;
                     };
-                    self.handle_track_manager_event(e).await?
+                    self.handle_track_manager_event(&tx, e).await?;
                 }
-                _ = token.cancelled() => {
+                () = token.cancelled() => {
                     return Ok(());
                 }
             };
-            if let Some(e) = e {
-                tx.send(e)?;
+        }
+        Ok(())
+    }
+
+    async fn handle_player_event(&self, tx: &Broadcast, e: PlayerEvent) -> AnyResult<()> {
+        tracing::debug!(event = ?e, "player event");
+        match e.kind {
+            PlayerEventKind::Muted => tx.broadcast(Event::Muted)?,
+            PlayerEventKind::Unmuted => tx.broadcast(Event::Unmuted)?,
+            PlayerEventKind::Volume(level) => tx.broadcast(Event::Volume { level })?,
+            PlayerEventKind::PlaybackStarted => tx.broadcast(Event::PlaybackStarted)?,
+            PlayerEventKind::PlaybackPaused => tx.broadcast(Event::PlaybackPaused)?,
+            PlayerEventKind::PlaybackStopped => {
+                let mut data = self.data.write().await;
+                data.stop(&self.manager)?;
+                tx.broadcast(Event::PlaybackStopped)?;
+            }
+            PlayerEventKind::TrackAdded(queue_id) => {
+                let mut data = self.data.write().await;
+                data.ready_queue(queue_id);
+            }
+            PlayerEventKind::TrackStarted(queue_id) => {
+                let mut data = self.data.write().await;
+                data.queue_player(&self.player).await?;
+                tx.broadcast(Event::NowPlaying {
+                    queue_id,
+                    track: data.get_queued_track(queue_id).meta.clone(),
+                })?;
+            }
+            PlayerEventKind::TrackFinished(queue_id) => {
+                let mut data = self.data.write().await;
+                data.remove_queue_player(&self.manager, queue_id)?;
+                if data.player_queue_size == 0 {
+                    if data.queue.is_empty() {
+                        tx.broadcast(Event::QueueFinished)?;
+                    } else {
+                        tx.broadcast(Event::WaitingForDownload)?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    async fn handle_player_event(&self, e: PlayerEvent) -> AnyResult<Option<Event>> {
-        tracing::debug!(event = ?e, "player event");
-        Ok(match e {
-            PlayerEvent::PlaybackStarted => Some(Event::PlaybackStarted),
-            PlayerEvent::PlaybackPaused => Some(Event::PlaybackPaused),
-            PlayerEvent::PlaybackStopped => {
-                let mut data = self.data.write().await;
-                data.stop(&self.manager).await?;
-                Some(Event::PlaybackStopped)
-            }
-            PlayerEvent::TrackAdded(queue_id) => {
-                let mut data = self.data.write().await;
-                data.ready_queue(queue_id);
-                None
-            }
-            PlayerEvent::TrackStarted(queue_id) => {
-                let mut data = self.data.write().await;
-                data.queue_player(&self.player).await?;
-                Some(Event::NowPlaying {
-                    queue_id,
-                    track: data.get_queued_track(queue_id).meta.clone(),
-                })
-            }
-            PlayerEvent::TrackFinished(queue_id) => {
-                let mut data = self.data.write().await;
-                data.remove_queue_player(&self.manager, queue_id).await?;
-                if data.player_queue_size == 0 {
-                    Some(Event::QueueFinished)
-                } else {
-                    None
-                }
-            }
-        })
-    }
-
-    async fn handle_track_manager_event(&self, e: ManagerEvent) -> AnyResult<Option<Event>> {
+    async fn handle_track_manager_event(&self, tx: &Broadcast, e: ManagerEvent) -> AnyResult<()> {
         tracing::debug!(event = ?e, "track manager event");
-        Ok(match e {
-            ManagerEvent::Acquired { id, err } => {
+        match e {
+            ManagerEvent::Acquired { origin_id, id, err } => {
                 let mut data = self.data.write().await;
                 if let Some(err) = err {
-                    data.remove_track(&id);
-                    Some(Event::DownloadError { err })
+                    let track = data.remove_track(&id);
+                    tx.direct(origin_id, Event::DownloadError { track, err })?;
                 } else {
                     data.ready_track(&id);
                     data.queue_player(&self.player).await?;
-                    None
                 }
             }
             ManagerEvent::Removed { id } => {
                 let mut data = self.data.write().await;
                 data.unready_track(&id);
-                None
             }
-        })
+        }
+        Ok(())
     }
 
     async fn serve_forever(
         state: Arc<Self>,
         token: CancellationToken,
-        tx: EventTx,
+        tx: Broadcast,
         prx: PlayerReceiver,
         mrx: ManagerReceiver,
     ) -> AnyResult<()> {
@@ -269,7 +396,8 @@ impl Data {
         Self {
             queue: Map::new(),
             tracks: Map::new(),
-            counter: ConsistentCounter::default(),
+            queue_counter: ConsistentCounter::default(),
+            origin_counter: RelaxedCounter::default(),
             player_queue_size: 0,
             auto_play,
         }
@@ -282,7 +410,7 @@ impl Data {
         }
     }
 
-    fn remove_track(&mut self, id: &TrackId) {
+    fn remove_track(&mut self, id: &TrackId) -> Track {
         let to_remove = self
             .queue
             .iter()
@@ -291,7 +419,8 @@ impl Data {
         for i in to_remove {
             self.queue.remove(&i);
         }
-        self.tracks.remove(id);
+        let t = self.tracks.remove(id).unwrap();
+        t.meta
     }
 
     fn ready_track(&mut self, id: &TrackId) {
@@ -312,21 +441,23 @@ impl Data {
         self.tracks.get(url).unwrap()
     }
 
-    async fn queue(
+    fn queue(
         &mut self,
-        manager: &Manager,
+        origin_id: OriginId,
+        manager: &TrackManager,
         tracks: Vec<Track>,
-    ) -> AnyResult<Vec<QueuedTrack>> {
+    ) -> ChannelResult<Vec<QueuedTrack>> {
         let mut result = Vec::with_capacity(tracks.len());
 
         for track in tracks {
-            manager.claim(track.id.clone()).await?;
-            let queue_id = self.counter.inc();
+            manager.claim(origin_id, track.id.clone())?;
+            let queue_id = self.queue_counter.inc();
             self.queue.insert(
                 queue_id,
                 QueueData {
                     track_id: track.id.clone(),
                     ready: false,
+                    origin_id,
                 },
             );
             if !self.tracks.contains_key(&track.id) {
@@ -345,7 +476,7 @@ impl Data {
     }
 
     async fn queue_player(&mut self, player: &Player) -> PlayerResult<()> {
-        let Some((queue_id, _)) = self.queue.iter().find(|(_, x)| !x.ready) else {
+        let Some((queue_id, QueueData{track_id: _, ready: _, origin_id})) = self.queue.iter().find(|(_, x)| !x.ready) else {
             return Ok(());
         };
 
@@ -354,30 +485,32 @@ impl Data {
             return Ok(());
         }
 
-        player.queue(*queue_id, track.meta.path.clone()).await?;
+        player
+            .queue(*origin_id, *queue_id, track.meta.path.clone())
+            .await?;
         if self.auto_play && self.player_queue_size == 0 {
             tracing::debug!("requesting auto play");
-            player.play().await?;
+            player.play(*origin_id).await?;
         }
 
         Ok(())
     }
 
-    async fn remove_queue_player(&mut self, manager: &Manager, id: QueueId) -> AnyResult<()> {
+    fn remove_queue_player(&mut self, manager: &TrackManager, id: QueueId) -> ChannelResult<()> {
         let Some(x) = self.queue.remove(&id) else {
             return Ok(());
         };
-        manager.unclaim(x.track_id).await?;
+        manager.unclaim(x.track_id)?;
         self.player_queue_size -= 1;
         Ok(())
     }
 
-    async fn stop(&mut self, manager: &Manager) -> AnyResult<()> {
-        manager.clear().await?;
+    fn stop(&mut self, manager: &TrackManager) -> ChannelResult<()> {
+        manager.clear()?;
         self.queue.clear();
         self.tracks.clear();
         self.player_queue_size = 0;
-        self.counter.reset();
+        self.queue_counter.reset();
         Ok(())
     }
 }
@@ -395,7 +528,14 @@ impl<'a> Iterator for DataIterator<'a> {
     type Item = (&'a QueueId, &'a Track);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (queue_id, QueueData { track_id, ready: _ }) = self.iter.next()?;
+        let (
+            queue_id,
+            QueueData {
+                track_id,
+                ready: _,
+                origin_id: _,
+            },
+        ) = self.iter.next()?;
         let track = &self.parent.tracks.get(track_id).unwrap().meta;
         Some((queue_id, track))
     }

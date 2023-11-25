@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = { version = "1.0.75", features = ["backtrace"] }
-async-channel = "2.1.0"
 atomic-counter = "1.0.1"
 camino = "1.1.6"
 clap = { version = "4.4.8", features = ["cargo", "env", "derive", "string"] }
@@ -16,6 +15,8 @@ mimalloc = "0.1.39"
 num_cpus = "1.16.0"
 once_cell = { version = "1.18.0", features = ["parking_lot"] }
 pyo3 = { version = "0.20.0", features = ["auto-initialize"] }
+rand = "0.8.5"
+regex = "1.10.2"
 rodio = { version = "0.17.3", features = ["symphonia-aac", "symphonia-isomp4"] }
 rust-embed = { version = "8.0.0", features = [
   "include-exclude",

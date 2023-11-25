@@ -1,8 +1,10 @@
-/target
-/dist
+target/
+dist/
+data/
+.venv/
+__pycache__/
 perf.data*
 *.perf
 *.svg
 *.trace
 .env
-data/
