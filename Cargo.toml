@@ -1,0 +1,49 @@
+[package]
+name = "yt-music-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0.75", features = ["backtrace"] }
+async-channel = "2.1.0"
+atomic-counter = "1.0.1"
+camino = "1.1.6"
+clap = { version = "4.4.8", features = ["cargo", "env", "derive", "string"] }
+dotenvy = "0.15.7"
+futures = "0.3.29"
+itertools = "0.12.0"
+mimalloc = "0.1.39"
+num_cpus = "1.16.0"
+once_cell = { version = "1.18.0", features = ["parking_lot"] }
+pyo3 = { version = "0.20.0", features = ["auto-initialize"] }
+rodio = { version = "0.17.3", features = ["symphonia-aac", "symphonia-isomp4"] }
+rust-embed = { version = "8.0.0", features = [
+  "include-exclude",
+  "interpolate-folder-path",
+] }
+shell-words = "1.1.0"
+teloxide = { version = "0.12.2", default-features = false, features = [
+  "macros",
+  "rustls",
+  "sqlite-storage-rustls",
+  "throttle",
+] }
+thiserror = "1.0.50"
+tokio = { version = "1.34.0", features = [
+  "tracing",
+  "sync",
+  "rt-multi-thread",
+  "io-util",
+  "net",
+  "fs",
+  "signal",
+] }
+tokio-util = { version = "0.7.10", features = ["tracing"] }
+tracing = { version = "0.1.40", features = ["log", "valuable", "async-await"] }
+tracing-subscriber = { version = "0.3.18", features = [
+  "valuable",
+  "parking_lot",
+  "tracing",
+  "json",
+] }
+url = "2.4.1"

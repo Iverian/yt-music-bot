@@ -1,0 +1,8 @@
+/target
+/dist
+perf.data*
+*.perf
+*.svg
+*.trace
+.env
+data/

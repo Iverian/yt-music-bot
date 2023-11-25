@@ -1,0 +1,7 @@
+[build]
+rustflags = ["--cfg", "tracing_unstable", "--cfg", "tokio_unstable"]
+
+[profile.release]
+lto = true
+strip = false
+opt-level = 3

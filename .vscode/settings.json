@@ -1,0 +1,14 @@
+{
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+  "rust-analyzer.imports.granularity.enforce": true,
+  "rust-analyzer.imports.granularity.group": "module",
+  "rust-analyzer.imports.group.enable": true,
+  "rust-analyzer.imports.prefix": "crate",
+  "rust-analyzer.rustfmt.extraArgs": [
+    "+nightly"
+  ],
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.debug.engine": "vadimcn.vscode-lldb",
+}
