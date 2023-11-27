@@ -20,6 +20,7 @@ use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track, TrackId, Youtube};
 
 const BROADCAST_QUEUE_SIZE: usize = 8;
+const QUEUE_ID_START: usize = 1;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -50,10 +51,7 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-pub struct Receiver {
-    origin_id: OriginId,
-    rx: EventRx,
-}
+pub struct Receiver(EventRx);
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -69,6 +67,12 @@ pub enum Event {
     DownloadError { track: Track, err: YoutubeError },
 }
 
+#[derive(Clone)]
+pub struct EventWrapper {
+    pub origin_id: OriginId,
+    pub event: Event,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedTrack {
     pub queue_id: QueueId,
@@ -81,7 +85,6 @@ pub struct Data {
     pub queue: Map<QueueId, QueueData>,
     pub tracks: Map<TrackId, TrackData>,
     queue_counter: ConsistentCounter,
-    origin_counter: RelaxedCounter,
     player_queue_size: usize,
     auto_play: bool,
 }
@@ -108,22 +111,19 @@ type EventTx = broadcast::Sender<EventWrapper>;
 type EventRx = broadcast::Receiver<EventWrapper>;
 type Map<K, V> = BTreeMap<K, V>;
 
-#[derive(Clone)]
-struct EventWrapper {
-    origin_id: Option<OriginId>,
-    event: Event,
-}
-
 #[derive(Debug)]
 struct State {
     youtube: Youtube,
     player: Player,
     manager: TrackManager,
+    origin_id_counter: RelaxedCounter,
     data: RwLock<Data>,
 }
 
 #[derive(Clone)]
 struct Broadcast(EventTx);
+
+struct BroadcastProxy<'a>(&'a EventTx, OriginId);
 
 impl Controller {
     pub fn new(
@@ -149,22 +149,11 @@ impl Controller {
         (controller, handle)
     }
 
-    pub async fn subscribe(&self) -> (Sender, Receiver) {
-        let origin_id = self.state.data.write().await.origin_counter.inc();
-        let proxy = Sender {
-            origin_id,
-            state: self.state.clone(),
-        };
-        let receiver = Receiver {
-            origin_id,
-            rx: self.tx.subscribe(),
-        };
-        (proxy, receiver)
+    pub async fn subscribe(&self) -> Receiver {
+        Receiver(self.tx.subscribe())
     }
-}
 
-impl Sender {
-    pub async fn queue(&self, urls: Vec<Url>) -> Result<Vec<QueuedTrack>> {
+    pub async fn queue(&self, urls: Vec<Url>) -> Result<(OriginId, Vec<QueuedTrack>)> {
         let tracks = self
             .state
             .youtube
@@ -174,55 +163,81 @@ impl Sender {
                 YoutubeError::Channel(e) => Error::Channel(e),
                 e => Error::Youtube(e),
             })?;
-        self.state.queue(self.origin_id, tracks).await
+        let origin_id = self.state.origin_id_counter.inc();
+        let tracks = self.state.queue(origin_id, tracks).await?;
+        Ok((origin_id, tracks))
     }
 
-    pub async fn play(&self) -> PlayerResult<()> {
-        self.state.player.play(self.origin_id).await
+    pub async fn play(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.play(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn pause(&self) -> PlayerResult<()> {
-        self.state.player.pause(self.origin_id).await
+    pub async fn pause(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.pause(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn play_toggle(&self) -> PlayerResult<()> {
-        self.state.player.play_toggle(self.origin_id).await
+    pub async fn play_toggle(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.play_toggle(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn stop(&self) -> PlayerResult<()> {
-        self.state.player.stop(self.origin_id).await
+    pub async fn stop(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.stop(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn skip(&self) -> PlayerResult<()> {
-        self.state.player.skip(self.origin_id).await
+    pub async fn skip(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.skip(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn mute(&self) -> PlayerResult<()> {
-        self.state.player.mute(self.origin_id).await
+    pub async fn mute(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.mute(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn unmute(&self) -> PlayerResult<()> {
-        self.state.player.unmute(self.origin_id).await
+    pub async fn unmute(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.unmute(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn mute_toggle(&self) -> PlayerResult<()> {
-        self.state.player.mute_toggle(self.origin_id).await
+    pub async fn mute_toggle(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.mute_toggle(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn get_volume(&self) -> PlayerResult<()> {
-        self.state.player.get_volume(self.origin_id).await
+    pub async fn get_volume(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.get_volume(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn set_volume(&self, level: u8) -> PlayerResult<()> {
-        self.state.player.set_volume(self.origin_id, level).await
+    pub async fn set_volume(&self, level: u8) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.set_volume(origin_id, level).await?;
+        Ok(origin_id)
     }
 
-    pub async fn increase_volume(&self) -> PlayerResult<()> {
-        self.state.player.increase_volume(self.origin_id).await
+    pub async fn increase_volume(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.increase_volume(origin_id).await?;
+        Ok(origin_id)
     }
 
-    pub async fn decrease_volume(&self) -> PlayerResult<()> {
-        self.state.player.decrease_volume(self.origin_id).await
+    pub async fn decrease_volume(&self) -> PlayerResult<OriginId> {
+        let origin_id = self.state.origin_id_counter.inc();
+        self.state.player.decrease_volume(origin_id).await?;
+        Ok(origin_id)
     }
 
     pub async fn view(&self) -> RwLockReadGuard<'_, Data> {
@@ -231,17 +246,20 @@ impl Sender {
 }
 
 impl Broadcast {
-    fn broadcast(&self, event: Event) -> ChannelResult<()> {
-        self.0.send(EventWrapper {
-            origin_id: None,
-            event,
-        })?;
+    fn send(&self, origin_id: OriginId, event: Event) -> ChannelResult<()> {
+        self.0.send(EventWrapper { origin_id, event })?;
         Ok(())
     }
 
-    fn direct(&self, origin_id: OriginId, event: Event) -> ChannelResult<()> {
+    fn proxy(&self, origin_id: OriginId) -> BroadcastProxy<'_> {
+        BroadcastProxy(&self.0, origin_id)
+    }
+}
+
+impl<'a> BroadcastProxy<'a> {
+    fn send(&self, event: Event) -> ChannelResult<()> {
         self.0.send(EventWrapper {
-            origin_id: Some(origin_id),
+            origin_id: self.1,
             event,
         })?;
         Ok(())
@@ -250,26 +268,11 @@ impl Broadcast {
 
 impl Receiver {
     pub async fn recv(&mut self) -> Option<Event> {
-        loop {
-            match self.rx.recv().await {
-                Ok(EventWrapper {
-                    origin_id: Some(id),
-                    event,
-                }) if id == self.origin_id => {
-                    return Some(event);
-                }
-                Ok(EventWrapper {
-                    origin_id: None,
-                    event,
-                }) => {
-                    return Some(event);
-                }
-                Err(_) => {
-                    return None;
-                }
-                _ => {}
-            }
-        }
+        self.0.recv().await.ok().map(|x| x.event)
+    }
+
+    pub async fn recv_wrapped(&mut self) -> Option<EventWrapper> {
+        self.0.recv().await.ok()
     }
 }
 
@@ -279,6 +282,7 @@ impl State {
             player,
             manager,
             youtube,
+            origin_id_counter: RelaxedCounter::default(),
             data: RwLock::new(Data::new(auto_play)),
         })
     }
@@ -321,16 +325,17 @@ impl State {
 
     async fn handle_player_event(&self, tx: &Broadcast, e: PlayerEvent) -> AnyResult<()> {
         tracing::debug!(event = ?e, "player event");
+        let tx = tx.proxy(e.origin_id);
         match e.kind {
-            PlayerEventKind::Muted => tx.broadcast(Event::Muted)?,
-            PlayerEventKind::Unmuted => tx.broadcast(Event::Unmuted)?,
-            PlayerEventKind::Volume(level) => tx.broadcast(Event::Volume { level })?,
-            PlayerEventKind::PlaybackStarted => tx.broadcast(Event::PlaybackStarted)?,
-            PlayerEventKind::PlaybackPaused => tx.broadcast(Event::PlaybackPaused)?,
+            PlayerEventKind::Muted => tx.send(Event::Muted)?,
+            PlayerEventKind::Unmuted => tx.send(Event::Unmuted)?,
+            PlayerEventKind::Volume(level) => tx.send(Event::Volume { level })?,
+            PlayerEventKind::PlaybackStarted => tx.send(Event::PlaybackStarted)?,
+            PlayerEventKind::PlaybackPaused => tx.send(Event::PlaybackPaused)?,
             PlayerEventKind::PlaybackStopped => {
                 let mut data = self.data.write().await;
                 data.stop(&self.manager)?;
-                tx.broadcast(Event::PlaybackStopped)?;
+                tx.send(Event::PlaybackStopped)?;
             }
             PlayerEventKind::TrackAdded(queue_id) => {
                 let mut data = self.data.write().await;
@@ -339,7 +344,7 @@ impl State {
             PlayerEventKind::TrackStarted(queue_id) => {
                 let mut data = self.data.write().await;
                 data.queue_player(&self.player).await?;
-                tx.broadcast(Event::NowPlaying {
+                tx.send(Event::NowPlaying {
                     queue_id,
                     track: data.get_queued_track(queue_id).meta.clone(),
                 })?;
@@ -349,9 +354,9 @@ impl State {
                 data.remove_queue_player(&self.manager, queue_id)?;
                 if data.player_queue_size == 0 {
                     if data.queue.is_empty() {
-                        tx.broadcast(Event::QueueFinished)?;
+                        tx.send(Event::QueueFinished)?;
                     } else {
-                        tx.broadcast(Event::WaitingForDownload)?;
+                        tx.send(Event::WaitingForDownload)?;
                     }
                 }
             }
@@ -366,7 +371,7 @@ impl State {
                 let mut data = self.data.write().await;
                 if let Some(err) = err {
                     let track = data.remove_track(&id);
-                    tx.direct(origin_id, Event::DownloadError { track, err })?;
+                    tx.send(origin_id, Event::DownloadError { track, err })?;
                 } else {
                     data.ready_track(&id);
                     data.queue_player(&self.player).await?;
@@ -396,8 +401,7 @@ impl Data {
         Self {
             queue: Map::new(),
             tracks: Map::new(),
-            queue_counter: ConsistentCounter::default(),
-            origin_counter: RelaxedCounter::default(),
+            queue_counter: ConsistentCounter::new(QUEUE_ID_START),
             player_queue_size: 0,
             auto_play,
         }
@@ -451,7 +455,7 @@ impl Data {
 
         for track in tracks {
             manager.claim(origin_id, track.id.clone())?;
-            let queue_id = self.queue_counter.inc();
+            let queue_id = self.inc_queue_id();
             self.queue.insert(
                 queue_id,
                 QueueData {
@@ -476,7 +480,15 @@ impl Data {
     }
 
     async fn queue_player(&mut self, player: &Player) -> PlayerResult<()> {
-        let Some((queue_id, QueueData{track_id: _, ready: _, origin_id})) = self.queue.iter().find(|(_, x)| !x.ready) else {
+        let Some((
+            queue_id,
+            QueueData {
+                track_id: _,
+                ready: _,
+                origin_id,
+            },
+        )) = self.queue.iter().find(|(_, x)| !x.ready)
+        else {
             return Ok(());
         };
 
@@ -510,8 +522,27 @@ impl Data {
         self.queue.clear();
         self.tracks.clear();
         self.player_queue_size = 0;
-        self.queue_counter.reset();
+        self.reset_queue_counter();
         Ok(())
+    }
+
+    fn reset_queue_counter(&self) {
+        self.queue_counter.reset();
+        loop {
+            let new_id = self.queue_counter.inc();
+            if new_id + 1 == QUEUE_ID_START {
+                break;
+            }
+        }
+    }
+
+    fn inc_queue_id(&self) -> QueueId {
+        let new_id = self.queue_counter.inc();
+        // TODO: replace with sane wraparound handling
+        if new_id < QUEUE_ID_START {
+            panic!("wraparound in queue id");
+        }
+        new_id
     }
 }
 
