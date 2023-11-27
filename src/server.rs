@@ -117,7 +117,7 @@ impl Server {
                 r = listener.accept() => {
                     let (stream, _) = r?;
                     tracing::info!("accepted connection");
-                    Connection::spawn(self.token.child_token(), &self.controller, stream).await;
+                    Connection::spawn(self.token.child_token(), &self.controller, stream);
                 }
                 () = self.token.cancelled() => {
                     tracing::info!("admin server shutdown");
@@ -129,11 +129,11 @@ impl Server {
 }
 
 impl Connection {
-    async fn spawn(token: CancellationToken, controller: &Controller, stream: UnixStream) {
+    fn spawn(token: CancellationToken, controller: &Controller, stream: UnixStream) {
         let (reader, writer) = stream.into_split();
         let reader = BufReader::new(reader);
         let writer = Writer::new(writer);
-        let (tx, rx) = controller.subscribe().await;
+        let (tx, rx) = controller.subscribe();
         tokio::spawn(Connection::serve_notifications(rx, writer.clone()));
         let result = Self { token, tx, writer };
         tokio::spawn(result.serve_requests(reader));
@@ -241,10 +241,18 @@ impl Connection {
                 self.queue_request(args).await?;
             }
             Command::Volume => match Self::extract_volume_subcommand(args)? {
-                VolumeCommand::Get => self.tx.get_volume().await?,
-                VolumeCommand::Increase => self.tx.increase_volume().await?,
-                VolumeCommand::Decrease => self.tx.decrease_volume().await?,
-                VolumeCommand::Set(level) => self.tx.set_volume(level).await?,
+                VolumeCommand::Get => {
+                    self.tx.get_volume().await?;
+                }
+                VolumeCommand::Increase => {
+                    self.tx.increase_volume().await?;
+                }
+                VolumeCommand::Decrease => {
+                    self.tx.decrease_volume().await?;
+                }
+                VolumeCommand::Set(level) => {
+                    self.tx.set_volume(level).await?;
+                }
             },
             Command::Mute => {
                 self.tx.mute().await?;
@@ -314,12 +322,9 @@ impl Connection {
     async fn queue_tracks_request(&mut self, args: &[String]) -> Result<()> {
         let urls = args
             .iter()
-            .map(|x| {
-                x.parse()
-                    .map_err(|_| Error::InvalidYoutubeUrl(x.to_owned()))
-            })
+            .map(|x| x.parse().map_err(|_| Error::InvalidYoutubeUrl(x.clone())))
             .try_collect()?;
-        let tracks = self.tx.queue(urls).await?;
+        let (_, tracks) = self.tx.queue(urls).await?;
         self.writer
             .write(format!("... Queued {} tracks", tracks.len()))?;
         Ok(())
