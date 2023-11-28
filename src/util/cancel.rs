@@ -2,7 +2,7 @@ use anyhow::{Error as AnyError, Result as AnyResult};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub type Handle = JoinHandle<AnyResult<()>>;
+pub type Task = JoinHandle<AnyResult<()>>;
 
 pub async fn make_cancel_token() -> CancellationToken {
     let token = CancellationToken::new();
@@ -19,15 +19,15 @@ pub async fn make_cancel_token() -> CancellationToken {
 }
 
 #[tracing::instrument(skip_all)]
-pub async fn run_tasks(mut handles: Vec<Handle>, token: CancellationToken) -> AnyResult<()> {
-    while !handles.is_empty() {
-        match wait_for_any_handle(handles).await {
+pub async fn run_tasks(mut tasks: Vec<Task>, token: CancellationToken) -> AnyResult<()> {
+    while !tasks.is_empty() {
+        match wait_for_first_completed_task(tasks).await {
             Ok(h) => {
-                handles = h;
+                tasks = h;
             }
             Err((handles, e)) => {
                 token.cancel();
-                if let Err(e) = wait_for_all_handles(handles).await {
+                if let Err(e) = wait_for_all_tasks(handles).await {
                     tracing::warn!("suppressed error: {e}");
                 }
                 return Err(e);
@@ -38,8 +38,10 @@ pub async fn run_tasks(mut handles: Vec<Handle>, token: CancellationToken) -> An
 }
 
 #[tracing::instrument(skip_all)]
-async fn wait_for_any_handle(handles: Vec<Handle>) -> Result<Vec<Handle>, (Vec<Handle>, AnyError)> {
-    let (r, _, other) = futures::future::select_all(handles).await;
+async fn wait_for_first_completed_task(
+    tasks: Vec<Task>,
+) -> Result<Vec<Task>, (Vec<Task>, AnyError)> {
+    let (r, _, other) = futures::future::select_all(tasks).await;
     match r {
         Ok(r) => match r {
             Ok(()) => Ok(other),
@@ -50,8 +52,8 @@ async fn wait_for_any_handle(handles: Vec<Handle>) -> Result<Vec<Handle>, (Vec<H
 }
 
 #[tracing::instrument(skip_all)]
-async fn wait_for_all_handles(handles: Vec<Handle>) -> AnyResult<()> {
-    futures::future::join_all(handles)
+async fn wait_for_all_tasks(tasks: Vec<Task>) -> AnyResult<()> {
+    futures::future::join_all(tasks)
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?

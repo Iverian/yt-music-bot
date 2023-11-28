@@ -36,14 +36,20 @@ type EventRx = mpsc::UnboundedReceiver<Event>;
 struct Worker {
     tx: EventTx,
     downloader: Youtube,
-    state: HashMap<TrackId, TrackLock>,
-    queue: VecDeque<(OriginId, TrackId)>,
-    tracks: usize,
     cache_size: usize,
+    state: State,
+}
+
+#[derive(Default)]
+struct State {
+    tracks: HashMap<TrackId, TrackLock>,
+    queue: VecDeque<(OriginId, TrackId)>,
+    size: usize,
 }
 
 type TrackLock = Arc<Mutex<TrackState>>;
 
+#[derive(Debug)]
 struct TrackState {
     path: Option<Utf8PathBuf>,
     claims: usize,
@@ -63,9 +69,7 @@ impl TrackManager {
         let w = Worker {
             tx: etx,
             downloader,
-            state: HashMap::new(),
-            queue: VecDeque::new(),
-            tracks: 0,
+            state: State::default(),
             cache_size: 1 + cache_size,
         };
         tokio::task::spawn(w.serve_forever(rx));
@@ -105,14 +109,15 @@ impl Worker {
     }
 
     async fn claim(&mut self, origin_id: OriginId, id: TrackId) {
-        if let Some(lock) = self.state.get(&id) {
+        if let Some(lock) = self.state.tracks.get(&id) {
             let mut state = lock.lock().await;
+            tracing::info!(track_id = id, state = ?state, "existing claim");
             state.claim();
             if state.needs_download() {
-                if self.tracks >= self.cache_size {
-                    self.queue.push_back((origin_id, id));
+                if self.state.size >= self.cache_size {
+                    self.state.queue.push_back((origin_id, id));
                 } else {
-                    self.tracks += 1;
+                    self.state.size += 1;
                     self.download(origin_id, id, lock.clone());
                 }
             } else if state.present() {
@@ -126,19 +131,19 @@ impl Worker {
             }
         } else {
             let lock = TrackState::new_lock(1);
-            if self.tracks >= self.cache_size {
-                self.state.insert(id.clone(), lock);
-                self.queue.push_back((origin_id, id));
+            if self.state.size >= self.cache_size {
+                self.state.tracks.insert(id.clone(), lock);
+                self.state.queue.push_back((origin_id, id));
             } else {
-                self.tracks += 1;
-                self.state.insert(id.clone(), lock.clone());
+                self.state.size += 1;
+                self.state.tracks.insert(id.clone(), lock.clone());
                 self.download(origin_id, id, lock);
             }
         }
     }
 
     async fn unclaim(&mut self, id: TrackId) {
-        let Some(lock) = self.state.get(&id) else {
+        let Some(lock) = self.state.tracks.get(&id) else {
             return;
         };
 
@@ -151,20 +156,22 @@ impl Worker {
         self.tx.send(Event::Removed { id }).ok();
         state.remove().await;
 
-        if let Some((origin_id, id)) = self.queue.pop_front() {
-            let lock = self.state[&id].clone();
+        if let Some((origin_id, id)) = self.state.queue.pop_front() {
+            let lock = self.state.tracks[&id].clone();
             self.download(origin_id, id, lock);
         } else {
-            self.tracks -= 1;
+            self.state.size -= 1;
         }
     }
 
     async fn clear(&mut self) {
-        for lock in self.state.values() {
+        for lock in self.state.tracks.values() {
             let mut state = lock.lock().await;
             state.remove().await;
         }
-        self.state.clear();
+        self.state.tracks.clear();
+        self.state.queue.clear();
+        self.state.size = 0;
     }
 
     fn download(&self, origin_id: OriginId, id: TrackId, lock: TrackLock) {
@@ -207,7 +214,7 @@ impl TrackState {
     }
 
     fn needs_download(&self) -> bool {
-        self.claims == 0 && self.path.is_none()
+        self.claims <= 1 && self.path.is_none()
     }
 
     fn present(&self) -> bool {

@@ -15,6 +15,8 @@ pub struct Cli {
     pub download_dir: Utf8PathBuf,
     #[arg(long, env=env("UNIX_SOCKET_PATH"), default_value="music-server.sock")]
     pub unix_socket_path: Utf8PathBuf,
+    #[arg(long, env=env("TELEGRAM_BOT_TOKEN"))]
+    pub telegram_bot_token: String,
     /// Worker threads
     #[arg(long, short = 'w', env = env("WORKERS"), default_value_t = Self::default_workers())]
     pub workers: usize,

@@ -3113,6 +3113,7 @@ dependencies = [
  "camino",
  "clap",
  "dotenvy",
+ "dptree",
  "futures",
  "itertools 0.12.0",
  "mimalloc",

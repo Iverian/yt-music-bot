@@ -207,7 +207,12 @@ impl Worker {
 
     fn serve_forever(mut self, mut rx: RequestRx) {
         loop {
-            let Some(RequestEnvelope { tx, origin_id, payload }) = rx.blocking_recv() else {
+            let Some(RequestEnvelope {
+                tx,
+                origin_id,
+                payload,
+            }) = rx.blocking_recv()
+            else {
                 return;
             };
             tracing::info!(request=?payload, "player request");
@@ -217,9 +222,18 @@ impl Worker {
 
     fn request_handler(&mut self, origin_id: OriginId, payload: Request) -> Result<()> {
         match payload {
-            Request::Play => self.play_handler(origin_id),
-            Request::Pause => self.pause_handler(origin_id),
-            Request::PlayToggle => self.play_toggle_handler(origin_id),
+            Request::Play => {
+                self.play_handler(origin_id);
+                Ok(())
+            }
+            Request::Pause => {
+                self.pause_handler(origin_id);
+                Ok(())
+            }
+            Request::PlayToggle => {
+                self.play_toggle_handler(origin_id);
+                Ok(())
+            }
             Request::Stop => {
                 self.stop_handler(origin_id);
                 Ok(())
@@ -257,9 +271,6 @@ impl Worker {
     fn queue_handler(&mut self, origin_id: OriginId, path: Utf8PathBuf, id: usize) -> Result<()> {
         let track = open_track(path).map_err(|_| Error::InvalidTrack)?;
         self.send(origin_id, EventKind::TrackAdded(id));
-        if !self.sink.is_paused() && self.sink.empty() {
-            self.send(origin_id, EventKind::PlaybackStarted);
-        }
         self.sink
             .append(cb_track_started(self.tx.clone(), origin_id, id));
         self.sink.append(track);
@@ -335,12 +346,10 @@ impl Worker {
             self.send(origin_id, EventKind::PlaybackStopped);
         }
         self.sink.clear();
+        self.sink.pause();
     }
 
-    fn play_toggle_handler(&mut self, origin_id: OriginId) -> Result<()> {
-        if self.sink.empty() {
-            return Err(Error::QueueEmpty);
-        }
+    fn play_toggle_handler(&mut self, origin_id: OriginId) {
         if self.sink.is_paused() {
             self.send(origin_id, EventKind::PlaybackStarted);
             self.sink.play();
@@ -348,29 +357,20 @@ impl Worker {
             self.send(origin_id, EventKind::PlaybackPaused);
             self.sink.pause();
         }
-        Ok(())
     }
 
-    fn pause_handler(&mut self, origin_id: OriginId) -> Result<()> {
-        if self.sink.empty() {
-            return Err(Error::QueueEmpty);
-        }
+    fn pause_handler(&mut self, origin_id: OriginId) {
         if !self.sink.is_paused() {
             self.send(origin_id, EventKind::PlaybackPaused);
         }
         self.sink.pause();
-        Ok(())
     }
 
-    fn play_handler(&mut self, origin_id: OriginId) -> Result<()> {
-        if self.sink.empty() {
-            return Err(Error::QueueEmpty);
-        }
+    fn play_handler(&mut self, origin_id: OriginId) {
         if self.sink.is_paused() {
             self.send(origin_id, EventKind::PlaybackStarted);
         }
         self.sink.play();
-        Ok(())
     }
 
     fn send(&self, origin_id: OriginId, e: EventKind) {

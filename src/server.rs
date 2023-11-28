@@ -16,22 +16,34 @@ use crate::controller::{
     Sender as ControllerSender,
 };
 use crate::player::{Error as PlayerError, MAX_VOLUME};
-use crate::util::cancel::Handle;
+use crate::util::cancel::Task;
 use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track};
 
 const VOLUME_ERROR_MSG: &str = "invalid volume level; volume must be between 0 and 10";
 
-#[derive(Debug)]
-pub struct Server {
+pub fn spawn(
     token: CancellationToken,
+    path: Utf8PathBuf,
     controller: Controller,
+) -> AnyResult<Task> {
+    let listener = UnixListener::bind(&path)?;
+    tracing::info!(address = ?path, "admin server started");
+    let server = Server { token, controller };
+    let task = tokio::spawn(server.serve_forever(path, listener));
+    Ok(task)
 }
 
 type WriterTx = mpsc::UnboundedSender<WriteMessage>;
 type WriterRx = mpsc::UnboundedReceiver<WriteMessage>;
 type Reader = BufReader<OwnedReadHalf>;
 type Result<T> = core::result::Result<T, Error>;
+
+#[derive(Debug)]
+struct Server {
+    token: CancellationToken,
+    controller: Controller,
+}
 
 struct Connection {
     token: CancellationToken,
@@ -93,18 +105,6 @@ struct WriterWorker {
 struct TrackFmt<'a>(&'a Track);
 
 impl Server {
-    pub fn spawn(
-        token: CancellationToken,
-        controller: Controller,
-        path: Utf8PathBuf,
-    ) -> AnyResult<Handle> {
-        let listener = UnixListener::bind(&path)?;
-        tracing::info!(address = ?path, "admin server started");
-        let server = Self { token, controller };
-        let handle = tokio::spawn(server.serve_forever(path, listener));
-        Ok(handle)
-    }
-
     async fn serve_forever(self, path: Utf8PathBuf, listener: UnixListener) -> AnyResult<()> {
         let r = self.serve_forever_impl(listener).await;
         tokio::fs::remove_file(path).await.ok();
@@ -324,9 +324,7 @@ impl Connection {
             .iter()
             .map(|x| x.parse().map_err(|_| Error::InvalidYoutubeUrl(x.clone())))
             .try_collect()?;
-        let (_, tracks) = self.tx.queue(urls).await?;
-        self.writer
-            .write(format!("... Queued {} tracks", tracks.len()))?;
+        self.tx.queue(urls).await?;
         Ok(())
     }
 
@@ -380,6 +378,9 @@ impl Connection {
                 TrackFmt(&track),
                 err
             )),
+            Event::TracksQueued { tracks } => {
+                writer.write(format!("[*] {} tracks queued", tracks.len()))
+            }
         }
     }
 }
@@ -484,6 +485,7 @@ impl From<ControllerError> for Error {
         match value {
             ControllerError::Youtube(e) => Error::Youtube(e),
             ControllerError::Channel(e) => Error::Channel(e),
+            ControllerError::Player(e) => Error::Player(e),
         }
     }
 }
