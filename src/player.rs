@@ -13,9 +13,12 @@ use crate::util::channel::ChannelError;
 
 pub const MAX_VOLUME: u8 = 10;
 
+pub type Result<T> = core::result::Result<T, Error>;
 pub type EventTx = mpsc::UnboundedSender<Event>;
 pub type EventRx = mpsc::UnboundedReceiver<Event>;
-pub type Result<T> = core::result::Result<T, Error>;
+pub type OriginId = usize;
+pub type QueueId = usize;
+pub type Response = Option<Status>;
 
 #[derive(Debug)]
 pub struct Player {
@@ -38,6 +41,14 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct Status {
+    pub is_paused: bool,
+    pub is_muted: bool,
+    pub length: usize,
+    pub volume_level: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Event {
     pub origin_id: OriginId,
     pub kind: EventKind,
@@ -56,12 +67,26 @@ pub enum EventKind {
     TrackFinished(QueueId),
 }
 
-pub type OriginId = usize;
-pub type QueueId = usize;
+#[derive(Debug)]
+pub enum Request {
+    Play,
+    Pause,
+    PlayToggle,
+    Stop,
+    Skip,
+    Mute,
+    Unmute,
+    MuteToggle,
+    IncreaseVolume,
+    DecreaseVolume,
+    SetVolume { level: u8 },
+    Queue { id: QueueId, path: Utf8PathBuf },
+    Status,
+}
 
 type RequestTx = mpsc::UnboundedSender<RequestEnvelope>;
 type RequestRx = mpsc::UnboundedReceiver<RequestEnvelope>;
-type ResponseTx = oneshot::Sender<Result<()>>;
+type ResponseTx = oneshot::Sender<Result<Response>>;
 type StartupTx = oneshot::Sender<AnyResult<()>>;
 type OpenTrack = Decoder<BufReader<File>>;
 type Callback = EmptyCallback<f32>;
@@ -72,28 +97,11 @@ struct RequestEnvelope {
     payload: Request,
 }
 
-#[derive(Debug)]
-enum Request {
-    Play,
-    Pause,
-    PlayToggle,
-    Stop,
-    Skip,
-    Mute,
-    Unmute,
-    MuteToggle,
-    GetVolume,
-    IncreaseVolume,
-    DecreaseVolume,
-    SetVolume { level: u8 },
-    Queue { id: QueueId, path: Utf8PathBuf },
-}
-
 struct Worker {
     sink: Sink,
     tx: EventTx,
     volume_level: u8,
-    muted: bool,
+    is_muted: bool,
 }
 
 impl Player {
@@ -106,59 +114,7 @@ impl Player {
         Ok((Self { tx }, Receiver(erx)))
     }
 
-    pub async fn play(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::Play).await
-    }
-
-    pub async fn pause(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::Pause).await
-    }
-
-    pub async fn play_toggle(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::PlayToggle).await
-    }
-
-    pub async fn stop(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::Stop).await
-    }
-
-    pub async fn skip(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::Skip).await
-    }
-
-    pub async fn mute(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::Mute).await
-    }
-
-    pub async fn unmute(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::Unmute).await
-    }
-
-    pub async fn mute_toggle(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::MuteToggle).await
-    }
-
-    pub async fn get_volume(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::GetVolume).await
-    }
-
-    pub async fn set_volume(&self, origin_id: OriginId, level: u8) -> Result<()> {
-        self.request(origin_id, Request::SetVolume { level }).await
-    }
-
-    pub async fn increase_volume(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::IncreaseVolume).await
-    }
-
-    pub async fn decrease_volume(&self, origin_id: OriginId) -> Result<()> {
-        self.request(origin_id, Request::DecreaseVolume).await
-    }
-
-    pub async fn queue(&self, origin_id: OriginId, id: QueueId, path: Utf8PathBuf) -> Result<()> {
-        self.request(origin_id, Request::Queue { id, path }).await
-    }
-
-    async fn request(&self, origin_id: OriginId, payload: Request) -> Result<()> {
+    pub async fn request(&self, origin_id: OriginId, payload: Request) -> Result<Response> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(RequestEnvelope {
@@ -167,8 +123,8 @@ impl Player {
                 payload,
             })
             .map_err(|_| ChannelError)?;
-        rx.await.map_err(|_| ChannelError)??;
-        Ok(())
+        let r = rx.await.map_err(|_| ChannelError)??;
+        Ok(r)
     }
 }
 
@@ -191,7 +147,7 @@ impl Worker {
             sink,
             tx,
             volume_level: 10u8,
-            muted: false,
+            is_muted: false,
         };
         stx.send(Ok(())).unwrap();
         worker.serve_forever(rx);
@@ -220,51 +176,59 @@ impl Worker {
         }
     }
 
-    fn request_handler(&mut self, origin_id: OriginId, payload: Request) -> Result<()> {
+    fn request_handler(&mut self, origin_id: OriginId, payload: Request) -> Result<Response> {
         match payload {
             Request::Play => {
                 self.play_handler(origin_id);
-                Ok(())
             }
             Request::Pause => {
                 self.pause_handler(origin_id);
-                Ok(())
             }
             Request::PlayToggle => {
                 self.play_toggle_handler(origin_id);
-                Ok(())
             }
             Request::Stop => {
                 self.stop_handler(origin_id);
-                Ok(())
             }
-            Request::Skip => self.skip_handler(),
+            Request::Skip => {
+                self.skip_handler()?;
+            }
             Request::Mute => {
                 self.mute_handler(origin_id);
-                Ok(())
             }
             Request::Unmute => {
                 self.unmute_handler(origin_id);
-                Ok(())
             }
             Request::MuteToggle => {
                 self.mute_toggle_handler(origin_id);
-                Ok(())
             }
-            Request::GetVolume => {
-                self.get_volume(origin_id);
-                Ok(())
+            Request::SetVolume { level } => {
+                self.set_volume_handler(origin_id, level)?;
             }
-            Request::SetVolume { level } => self.set_volume_handler(origin_id, level),
             Request::IncreaseVolume => {
                 self.change_volume_handler(origin_id, 1);
-                Ok(())
             }
             Request::DecreaseVolume => {
                 self.change_volume_handler(origin_id, -1);
-                Ok(())
             }
-            Request::Queue { id, path } => self.queue_handler(origin_id, path, id),
+            Request::Queue { id, path } => {
+                self.queue_handler(origin_id, path, id)?;
+            }
+            Request::Status => {
+                return Ok(Some(self.status_handler()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn status_handler(&mut self) -> Status {
+        let sink_length = self.sink.len();
+
+        Status {
+            is_paused: self.sink.is_paused(),
+            is_muted: self.is_muted,
+            length: sink_length / 3 + usize::from(sink_length % 3 > 1),
+            volume_level: self.volume_level,
         }
     }
 
@@ -282,7 +246,7 @@ impl Worker {
     fn change_volume_handler(&mut self, origin_id: OriginId, modifier: i8) {
         self.volume_level = change_level(self.volume_level, modifier);
         self.send(origin_id, EventKind::Volume(self.volume_level));
-        if !self.muted {
+        if !self.is_muted {
             self.sink.set_volume(level_to_volume(self.volume_level));
         }
     }
@@ -293,43 +257,39 @@ impl Worker {
         }
         self.volume_level = level;
         self.send(origin_id, EventKind::Volume(self.volume_level));
-        if !self.muted {
+        if !self.is_muted {
             self.sink.set_volume(level_to_volume(self.volume_level));
         }
         Ok(())
     }
 
-    fn get_volume(&mut self, origin_id: OriginId) {
-        self.send(origin_id, EventKind::Volume(self.volume_level));
-    }
-
     fn mute_toggle_handler(&mut self, origin_id: OriginId) {
-        if self.muted {
+        if self.is_muted {
             self.send(origin_id, EventKind::Unmuted);
-            self.muted = false;
+            self.is_muted = false;
             self.sink.set_volume(level_to_volume(self.volume_level));
         } else {
             self.send(origin_id, EventKind::Muted);
-            self.muted = true;
+            self.is_muted = true;
             self.sink.set_volume(0.);
         }
     }
 
     fn unmute_handler(&mut self, origin_id: OriginId) {
-        if !self.muted {
+        if !self.is_muted {
             return;
         }
         self.send(origin_id, EventKind::Unmuted);
-        self.muted = false;
+        self.is_muted = false;
         self.sink.set_volume(level_to_volume(self.volume_level));
     }
 
     fn mute_handler(&mut self, origin_id: OriginId) {
-        if self.muted {
+        if self.is_muted {
             return;
         }
         self.send(origin_id, EventKind::Muted);
-        self.muted = true;
+        self.is_muted = true;
         self.sink.set_volume(0.);
     }
 

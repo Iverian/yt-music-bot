@@ -78,10 +78,10 @@ enum Command {
     Mute,
     Unmute,
     MuteToggle,
+    Info,
 }
 
 enum VolumeCommand {
-    Get,
     Increase,
     Decrease,
     Set(u8),
@@ -241,9 +241,6 @@ impl Connection {
                 self.queue_request(args).await?;
             }
             Command::Volume => match Self::extract_volume_subcommand(args)? {
-                VolumeCommand::Get => {
-                    self.tx.get_volume().await?;
-                }
                 VolumeCommand::Increase => {
                     self.tx.increase_volume().await?;
                 }
@@ -262,6 +259,16 @@ impl Connection {
             }
             Command::MuteToggle => {
                 self.tx.mute_toggle().await?;
+            }
+            Command::Info => {
+                let status = self.tx.player_status().await?;
+                self.writer.write(format!(
+                    "... [{:1}] {:6} {:2} : {} in queue",
+                    if status.is_paused { "⏸" } else { "▶️" },
+                    if status.is_muted { "muted" } else { "volume" },
+                    status.volume_level,
+                    status.length,
+                ))?;
             }
         }
 
@@ -282,6 +289,7 @@ impl Connection {
             "unmute" => Command::Unmute,
             "mute-toggle" | "m" => Command::MuteToggle,
             "volume" | "v" => Command::Volume,
+            "info" | "i" => Command::Info,
             _ => {
                 return Err(Error::InvalidRequest(format!(
                     "Unknown command {command:?}"
@@ -292,7 +300,9 @@ impl Connection {
 
     fn extract_volume_subcommand(args: &[String]) -> Result<VolumeCommand> {
         if args.is_empty() {
-            return Ok(VolumeCommand::Get);
+            return Err(Error::InvalidRequest(
+                "One argument expected +/-/num".to_owned(),
+            ));
         }
         match args[0].as_str() {
             "+" => Ok(VolumeCommand::Increase),
@@ -337,13 +347,13 @@ impl Connection {
             let queue = view
                 .iter()
                 .enumerate()
-                .map(|(i, (_, t))| {
+                .map(|(i, j)| {
                     let idx = if i == 0 {
                         "*".to_owned()
                     } else {
                         format!("{i}")
                     };
-                    format!("... ({idx}) {}", TrackFmt(t))
+                    format!("... ({idx}) {}", TrackFmt(j.track))
                 })
                 .collect_vec();
             self.writer.write_many(queue)?;

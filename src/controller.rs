@@ -12,7 +12,8 @@ use url::Url;
 
 use crate::player::{
     Error as PlayerError, Event as PlayerEvent, EventKind as PlayerEventKind, OriginId, Player,
-    QueueId, Receiver as PlayerReceiver, Result as PlayerResult,
+    QueueId, Receiver as PlayerReceiver, Request as PlayerRequest, Result as PlayerResult,
+    Status as PlayerStatus,
 };
 use crate::track_manager::{Event as ManagerEvent, Receiver as ManagerReceiver, TrackManager};
 use crate::util::cancel::Task;
@@ -89,9 +90,24 @@ pub struct Data {
     queue_id_counter: ConsistentCounter,
 }
 
+#[derive(Debug)]
 pub struct DataIterator<'a> {
     parent: &'a Data,
     iter: BTreeIter<'a, QueueId, QueueData>,
+}
+
+#[derive(Debug)]
+pub struct DataItemView<'a> {
+    pub queue_id: QueueId,
+    pub state: QueuedTrackState,
+    pub track: &'a Track,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum QueuedTrackState {
+    NotReady,
+    Downloaded,
+    SentToPlayer,
 }
 
 #[derive(Debug)]
@@ -125,13 +141,6 @@ struct State {
 struct Broadcast(EventTx);
 
 struct BroadcastProxy<'a>(&'a EventTx, OriginId);
-
-enum QueueTrackState {
-    NotPresent,
-    NotReady,
-    Downloaded,
-    SentToPlayer,
-}
 
 impl Controller {
     pub fn new(
@@ -191,74 +200,114 @@ impl Sender {
 
     pub async fn play(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.play(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::Play)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn pause(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.pause(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::Pause)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn play_toggle(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.play_toggle(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::PlayToggle)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn stop(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.stop(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::Stop)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn skip(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.skip(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::Skip)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn mute(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.mute(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::Mute)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn unmute(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.unmute(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::Unmute)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn mute_toggle(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.mute_toggle(origin_id).await?;
-        Ok(origin_id)
-    }
-
-    pub async fn get_volume(&self) -> Result<OriginId> {
-        let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.get_volume(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::MuteToggle)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn set_volume(&self, level: u8) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.set_volume(origin_id, level).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::SetVolume { level })
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn increase_volume(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.increase_volume(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::IncreaseVolume)
+            .await?;
         Ok(origin_id)
     }
 
     pub async fn decrease_volume(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
-        self.state.player.decrease_volume(origin_id).await?;
+        self.state
+            .player
+            .request(origin_id, PlayerRequest::DecreaseVolume)
+            .await?;
         Ok(origin_id)
+    }
+
+    pub async fn player_status(&self) -> Result<PlayerStatus> {
+        let mut status = self
+            .state
+            .player
+            .request(usize::MAX, PlayerRequest::Status)
+            .await?
+            .unwrap();
+        let data = self.state.data.read().await;
+        let queue_length = data.queue.len() - usize::from(status.length != 0);
+        status.length = queue_length;
+        Ok(status)
     }
 
     pub async fn view(&self) -> RwLockReadGuard<'_, Data> {
@@ -314,7 +363,7 @@ impl State {
         let was_empty = data.queue.is_empty();
         let result = data.queue(origin_id, &self.manager, tracks)?;
         if self.auto_play && was_empty {
-            self.player.play(origin_id).await?;
+            self.player.request(origin_id, PlayerRequest::Play).await?;
         }
         Ok(result)
     }
@@ -379,16 +428,16 @@ impl State {
                 let mut data = self.data.write().await;
                 data.remove_queue_player(&self.manager, queue_id)?;
                 match data.first_track_state() {
-                    QueueTrackState::NotPresent => {
-                        tx.send(Event::QueueFinished)?;
-                    }
-                    QueueTrackState::NotReady => {
+                    Some(QueuedTrackState::NotReady) => {
                         tx.send(Event::WaitingForDownload)?;
                     }
-                    QueueTrackState::Downloaded => {
+                    Some(QueuedTrackState::Downloaded) => {
                         data.queue_player(&self.player).await?;
                     }
-                    QueueTrackState::SentToPlayer => {}
+                    Some(QueuedTrackState::SentToPlayer) => {}
+                    None => {
+                        tx.send(Event::QueueFinished)?;
+                    }
                 }
             }
         }
@@ -405,7 +454,7 @@ impl State {
                     tx.send(origin_id, Event::DownloadError { track, err })?;
                 } else {
                     data.ready_track(&id);
-                    if matches!(data.first_track_state(), QueueTrackState::Downloaded) {
+                    if matches!(data.first_track_state(), Some(QueuedTrackState::Downloaded)) {
                         data.queue_player(&self.player).await?;
                     }
                 }
@@ -501,28 +550,32 @@ impl Data {
         Ok(result)
     }
 
-    fn first_track_state(&self) -> QueueTrackState {
-        if let Some((
-            _,
-            QueueData {
-                track_id,
-                sent_to_player: ready,
-                origin_id: _,
-            },
-        )) = self.queue.first_key_value()
-        {
-            if *ready {
-                QueueTrackState::SentToPlayer
-            } else {
-                let track = self.tracks.get(track_id).unwrap();
-                if track.downloaded {
-                    QueueTrackState::Downloaded
-                } else {
-                    QueueTrackState::NotReady
-                }
-            }
+    fn first_track_state(&self) -> Option<QueuedTrackState> {
+        self.queue
+            .first_key_value()
+            .map(|(_, v)| self.get_track_state(v, None))
+    }
+
+    fn get_track_state(
+        &self,
+        queue_data: &QueueData,
+        track_data: Option<&TrackData>,
+    ) -> QueuedTrackState {
+        let QueueData {
+            track_id,
+            sent_to_player,
+            origin_id: _,
+        } = queue_data;
+
+        if *sent_to_player {
+            QueuedTrackState::SentToPlayer
         } else {
-            QueueTrackState::NotPresent
+            let track = track_data.or_else(|| self.tracks.get(track_id)).unwrap();
+            if track.downloaded {
+                QueuedTrackState::Downloaded
+            } else {
+                QueuedTrackState::NotReady
+            }
         }
     }
 
@@ -545,7 +598,13 @@ impl Data {
         }
 
         player
-            .queue(*origin_id, *queue_id, track.meta.path.clone())
+            .request(
+                *origin_id,
+                PlayerRequest::Queue {
+                    id: *queue_id,
+                    path: track.meta.path.clone(),
+                },
+            )
             .await?;
 
         Ok(())
@@ -605,19 +664,18 @@ impl<'a> IntoIterator for &'a Data {
 }
 
 impl<'a> Iterator for DataIterator<'a> {
-    type Item = (&'a QueueId, &'a Track);
+    type Item = DataItemView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (
+        let (&queue_id, queue_data) = self.iter.next()?;
+
+        let track = self.parent.tracks.get(&queue_data.track_id).unwrap();
+        let state = self.parent.get_track_state(queue_data, Some(track));
+        Some(DataItemView {
             queue_id,
-            QueueData {
-                track_id,
-                sent_to_player: _,
-                origin_id: _,
-            },
-        ) = self.iter.next()?;
-        let track = &self.parent.tracks.get(track_id).unwrap().meta;
-        Some((queue_id, track))
+            state,
+            track: &track.meta,
+        })
     }
 }
 
