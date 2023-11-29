@@ -12,6 +12,7 @@ dotenvy = "0.15.7"
 dptree = "0.3.0"
 futures = "0.3.29"
 itertools = "0.12.0"
+lru-cache = "0.1.2"
 mimalloc = "0.1.39"
 num_cpus = "1.16.0"
 once_cell = { version = "1.18.0", features = ["parking_lot"] }
@@ -23,6 +24,7 @@ rust-embed = { version = "8.0.0", features = [
   "include-exclude",
   "interpolate-folder-path",
 ] }
+serde = { version = "1.0.193", features = ["derive"] }
 shell-words = "1.1.0"
 teloxide = { version = "0.12.2", default-features = false, features = [
   "macros",
@@ -48,4 +50,4 @@ tracing-subscriber = { version = "0.3.18", features = [
   "tracing",
   "json",
 ] }
-url = "2.4.1"
+url = { version = "2.4.1", features = ["serde"] }

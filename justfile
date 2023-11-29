@@ -7,4 +7,4 @@ connect:
   nc -U music-server.sock
 
 run *OPTS:
-  cargo run {{ OPTS }}
+  poetry run -- cargo run {{ OPTS }}

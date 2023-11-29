@@ -1,8 +1,11 @@
 import functools
 import signal
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from multiprocessing import Pipe, Process, Queue
+from multiprocessing.connection import Connection
+from typing import Any, List, Mapping, Optional, Union
 
+from setproctitle import setproctitle
 from yt_dlp import YoutubeDL
 
 YOUTUBE_DL_OUTPUT_TEMPLATE = "%(id)s.%(ext)s"
@@ -26,14 +29,18 @@ YOUTUBE_DL_PARAMS = {
     "source_address": "0.0.0.0",
     "consoletitle": False,
     "color": "never",
-    "socket_timeout": 15,  # TODO: extract to config
 }
 YOUTUBE_DOWNLOAD_TIMEOUT_MSG = "Download timed out"
 
 E_UNKNOWN_OBJECT = 0
 E_OTHER = 1
 
+R_RESOLVE = 0
+R_DOWNLOAD = 1
+
 Params = Mapping[str, Any]
+RequestPayload = Union[List[str], str]
+ResponsePayload = Union[List["Track"], str]
 
 
 @dataclass
@@ -46,15 +53,103 @@ class Track:
     path: str
 
 
-class Youtube:
-    _yt: YoutubeDL
+@dataclass
+class Request:
+    kind: int
+    payload: RequestPayload
 
-    def __init__(self, download_dir: str, download_timeout_s: int = 30) -> None:
-        self._yt = YoutubeDL(self._make_params(download_dir))
-        self._download_timeout_s = download_timeout_s
+
+@dataclass
+class RequestWrapper:
+    tx: Connection
+    request: Request
+
+
+class Youtube:
+    _queue: Queue
+    _jobs: List[Process]
+
+    def __init__(self, download_dir: str, jobs: int = 1, download_timeout_s: int = 15):
+        params = self._make_params(download_dir, download_timeout_s)
+        self._queue = Queue(maxsize=jobs)
+        self._jobs = [_Worker.spawn(1 + i, self._queue, params) for i in range(jobs)]
 
     def close(self):
-        self._yt.close()
+        for _ in self._jobs:
+            self._queue.put(None)
+        for process in self._jobs:
+            try:
+                process.join()
+                process.close()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
+    def resolve(self, urls: List[str]) -> List[Track]:
+        return self._request(R_RESOLVE, urls)  # type: ignore
+
+    def download(self, url: str) -> str:
+        return self._request(R_DOWNLOAD, url)  # type: ignore
+
+    def _request(self, kind: int, payload: RequestPayload):
+        rx, tx = Pipe(duplex=False)
+        self._queue.put(RequestWrapper(tx, Request(kind, payload)))
+        r = rx.recv()
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    @staticmethod
+    def _make_params(download_dir: str, download_timeout_s: int) -> Params:
+        params = YOUTUBE_DL_PARAMS.copy()
+        params["cachedir"] = download_dir
+        params["outtmpl"] = f"{download_dir}/{YOUTUBE_DL_OUTPUT_TEMPLATE}"
+        params["socket_timeout"] = download_timeout_s
+        return params
+
+
+class _Worker:
+    _yt: YoutubeDL
+    _download_timeout_s: int
+
+    def __init__(self, params: Params):
+        self._yt = YoutubeDL(params)
+        self._download_timeout_s = int(params.get("socket_timeout", 15))
+
+    @staticmethod
+    def spawn(worker_id: int, queue: Queue, params: Params) -> Process:
+        process = Process(target=_Worker.run, args=(worker_id, queue, params))
+        process.start()
+        return process
+
+    @staticmethod
+    def run(worker_id: int, queue: Queue, params: Params):
+        setproctitle(f"[youtube-download-worker:{worker_id:02d}]")
+        worker = _Worker(params)
+        try:
+            while True:
+                r: Optional[RequestWrapper] = queue.get()
+                if not r:
+                    break
+                try:
+                    response = worker.handle(r.request.kind, r.request.payload)
+                    r.tx.send(response)
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    r.tx.send(e)
+        finally:
+            worker.close()
+
+    def close(self):
+        try:
+            self._yt.close()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    def handle(self, kind: int, payload: Union[List[str], str]) -> ResponsePayload:
+        if kind == R_RESOLVE:
+            return self.resolve(payload)  # type: ignore
+        if kind == R_DOWNLOAD:
+            return self.download(payload)  # type: ignore
+        raise NotImplementedError()
 
     def resolve(self, urls: List[str]) -> List[Track]:
         result = []
@@ -118,13 +213,6 @@ class Youtube:
             duration_s=int(data["duration"]),
             path=str(self._yt.prepare_filename(data)),
         )
-
-    @staticmethod
-    def _make_params(download_dir: str) -> Params:
-        params = YOUTUBE_DL_PARAMS.copy()
-        params["cachedir"] = download_dir
-        params["outtmpl"] = f"{download_dir}/{YOUTUBE_DL_OUTPUT_TEMPLATE}"
-        return params
 
 
 class Error(Exception):

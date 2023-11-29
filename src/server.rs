@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::controller::{
-    Controller, Error as ControllerError, Event, Receiver as ControllerReceiver,
+    Controller, Error as ControllerError, Event, QueuedTrackState, Receiver as ControllerReceiver,
     Sender as ControllerSender,
 };
 use crate::player::{Error as PlayerError, MAX_VOLUME};
@@ -261,7 +261,7 @@ impl Connection {
                 self.tx.mute_toggle().await?;
             }
             Command::Info => {
-                let status = self.tx.player_status().await?;
+                let status = self.tx.status().await?;
                 self.writer.write(format!(
                     "... [{:1}] {:6} {:2} : {} in queue",
                     if status.is_paused { "⏸" } else { "▶️" },
@@ -353,7 +353,12 @@ impl Connection {
                     } else {
                         format!("{i}")
                     };
-                    format!("... ({idx}) {}", TrackFmt(j.track))
+                    let state = match j.state {
+                        QueuedTrackState::NotReady => 'x',
+                        QueuedTrackState::Downloaded => 'd',
+                        QueuedTrackState::SentToPlayer => 's',
+                    };
+                    format!("... ({idx:02}) [{state:1}] {}", TrackFmt(j.track))
                 })
                 .collect_vec();
             self.writer.write_many(queue)?;

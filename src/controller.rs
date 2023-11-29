@@ -13,7 +13,6 @@ use url::Url;
 use crate::player::{
     Error as PlayerError, Event as PlayerEvent, EventKind as PlayerEventKind, OriginId, Player,
     QueueId, Receiver as PlayerReceiver, Request as PlayerRequest, Result as PlayerResult,
-    Status as PlayerStatus,
 };
 use crate::track_manager::{Event as ManagerEvent, Receiver as ManagerReceiver, TrackManager};
 use crate::util::cancel::Task;
@@ -51,6 +50,15 @@ pub enum Error {
     Youtube(#[from] YoutubeError),
     #[error(transparent)]
     Channel(#[from] ChannelError),
+}
+
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub is_paused: bool,
+    pub is_muted: bool,
+    pub volume_level: u8,
+    pub length: usize,
+    pub now_playing: Option<Track>,
 }
 
 #[derive(Debug)]
@@ -297,17 +305,23 @@ impl Sender {
         Ok(origin_id)
     }
 
-    pub async fn player_status(&self) -> Result<PlayerStatus> {
-        let mut status = self
+    pub async fn status(&self) -> Result<Status> {
+        let status = self
             .state
             .player
             .request(usize::MAX, PlayerRequest::Status)
             .await?
             .unwrap();
         let data = self.state.data.read().await;
-        let queue_length = data.queue.len() - usize::from(status.length != 0);
-        status.length = queue_length;
-        Ok(status)
+        let length = data.queue.len() - usize::from(status.length != 0);
+        let now_playing = data.get_now_playing_track().cloned();
+        Ok(Status {
+            is_paused: status.is_paused,
+            is_muted: status.is_muted,
+            volume_level: status.volume_level,
+            length,
+            now_playing,
+        })
     }
 
     pub async fn view(&self) -> RwLockReadGuard<'_, Data> {
@@ -514,6 +528,25 @@ impl Data {
     fn get_queued_track(&self, id: QueueId) -> &TrackData {
         let url = &self.queue.get(&id).unwrap().track_id;
         self.tracks.get(url).unwrap()
+    }
+
+    fn get_now_playing_track(&self) -> Option<&Track> {
+        let Some((
+            _,
+            QueueData {
+                track_id,
+                sent_to_player,
+                origin_id: _,
+            },
+        )) = self.queue.first_key_value()
+        else {
+            return None;
+        };
+        if !sent_to_player {
+            return None;
+        }
+        let track = self.tracks.get(track_id).unwrap();
+        Some(&track.meta)
     }
 
     fn queue(

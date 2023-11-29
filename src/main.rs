@@ -35,6 +35,7 @@ async fn run(cli: Cli) -> AnyResult<()> {
         cli.unix_socket_path,
         cli.telegram_bot_token,
         download_dir,
+        cli.youtube_workers,
         controller_settings,
     )
     .await;
@@ -47,12 +48,13 @@ async fn run_inner(
     unix_socket_path: Utf8PathBuf,
     telegram_bot_token: String,
     download_dir: Utf8PathBuf,
+    youtube_workers: usize,
     controller_settings: ControllerSettings,
 ) -> AnyResult<()> {
     let token = make_cancel_token().await;
 
     let (player, player_receiver) = Player::new().await?;
-    let youtube = Youtube::new(download_dir).await?;
+    let youtube = Youtube::new(download_dir, youtube_workers).await?;
 
     let (controller, controller_task) = Controller::new(
         token.child_token(),

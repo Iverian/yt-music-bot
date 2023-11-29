@@ -113,10 +113,10 @@ struct Worker<'a> {
 }
 
 impl Youtube {
-    pub async fn new(download_dir: Utf8PathBuf) -> AnyResult<Self> {
-        let (tx, rx) = mpsc::channel(1);
+    pub async fn new(download_dir: Utf8PathBuf, jobs: usize) -> AnyResult<Self> {
+        let (tx, rx) = mpsc::channel(jobs);
         let (stx, srx) = oneshot::channel();
-        thread::spawn(move || Worker::run(stx, rx, &download_dir));
+        thread::spawn(move || Worker::run(stx, rx, &download_dir, jobs));
         srx.await??;
         Ok(Self { tx })
     }
@@ -211,9 +211,9 @@ impl<'a> Worker<'a> {
 }
 
 impl Worker<'_> {
-    fn run(stx: StartupTx, rx: RequestRx, download_dir: &Utf8Path) {
+    fn run(stx: StartupTx, rx: RequestRx, download_dir: &Utf8Path, jobs: usize) {
         Python::with_gil(|py| {
-            let server = match Self::load_python_code(py, download_dir) {
+            let server = match Self::load_python_code(py, download_dir, jobs) {
                 Ok(x) => x,
                 Err(e) => {
                     stx.send(Err(e.into())).unwrap();
@@ -227,10 +227,14 @@ impl Worker<'_> {
         });
     }
 
-    fn load_python_code<'b>(py: Python<'b>, download_dir: &Utf8Path) -> PyResult<&'b PyAny> {
+    fn load_python_code<'b>(
+        py: Python<'b>,
+        download_dir: &Utf8Path,
+        jobs: usize,
+    ) -> PyResult<&'b PyAny> {
         let module = PyModule::from_code(py, &PYTHON_CODE, PYTHON_FILE, PYTHON_MODULE).unwrap();
         let server_class = module.getattr(intern!(py, PYTHON_CLASS)).unwrap();
-        let server = server_class.call1((download_dir.as_str(),))?;
+        let server = server_class.call1((download_dir.as_str(), jobs))?;
         Ok(server)
     }
 }
