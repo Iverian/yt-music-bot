@@ -126,12 +126,7 @@ impl State {
         if let Some(track) = data.tracks.get_mut(&id) {
             track.claim();
             if track.needs_download() {
-                if data.size == self.cache_size {
-                    data.queue.push_back((origin_id, id));
-                } else {
-                    data.size += 1;
-                    self.download(origin_id, id);
-                }
+                self.try_download(&mut data, origin_id, id);
             } else if track.present() {
                 self.tx.send(Event::Acquired { id })?;
             }
@@ -139,12 +134,7 @@ impl State {
             let mut track = TrackData::default();
             track.claim();
             data.tracks.insert(id.clone(), track);
-            if data.size == self.cache_size {
-                data.queue.push_back((origin_id, id));
-            } else {
-                data.size += 1;
-                self.download(origin_id, id);
-            }
+            self.try_download(&mut data, origin_id, id);
         }
         Ok(())
     }
@@ -163,15 +153,8 @@ impl State {
             return Ok(());
         }
         track.remove().await;
-        data.tracks.remove(&id);
+        self.rotate_track(&mut data, &id);
         self.tx.send(Event::Removed { id, e })?;
-
-        if let Some((origin_id, id)) = data.queue.pop_front() {
-            self.download(origin_id, id);
-        } else {
-            data.size -= 1;
-        }
-
         Ok(())
     }
 
@@ -204,17 +187,30 @@ impl State {
         e: YoutubeError,
     ) -> ChannelResult<()> {
         let mut data = self.data.lock().await;
-        data.tracks.remove(&id);
-        if let Some((origin_id, id)) = data.queue.pop_front() {
-            self.download(origin_id, id);
-        } else {
-            data.size -= 1;
-        }
+        self.rotate_track(&mut data, &id);
         self.tx.send(Event::Removed {
             id,
             e: Some((origin_id, e)),
         })?;
         Ok(())
+    }
+
+    fn try_download(self: &Arc<Self>, data: &mut Data, origin_id: usize, id: String) {
+        if data.size == self.cache_size {
+            data.queue.push_back((origin_id, id));
+        } else {
+            data.size += 1;
+            self.download(origin_id, id);
+        }
+    }
+
+    fn rotate_track(self: &Arc<Self>, data: &mut Data, id: &String) {
+        data.tracks.remove(id);
+        if let Some((origin_id, id)) = data.queue.pop_front() {
+            self.download(origin_id, id);
+        } else {
+            data.size -= 1;
+        }
     }
 }
 
@@ -261,8 +257,6 @@ impl TrackData {
             tracing::debug!(path = ?path, "remove track");
             tokio::fs::remove_file(path).await.ok();
         }
-        self.path = None;
-        self.claims = 0;
     }
 
     fn claim(&mut self) {
