@@ -461,21 +461,21 @@ impl State {
     async fn handle_track_manager_event(&self, tx: &Broadcast, e: ManagerEvent) -> AnyResult<()> {
         tracing::debug!(event = ?e, "track manager event");
         match e {
-            ManagerEvent::Acquired { origin_id, id, err } => {
+            ManagerEvent::Acquired { id } => {
                 let mut data = self.data.write().await;
-                if let Some(err) = err {
+                data.ready_track(&id);
+                if matches!(data.first_track_state(), Some(QueuedTrackState::Downloaded)) {
+                    data.queue_player(&self.player).await?;
+                }
+            }
+            ManagerEvent::Removed { id, e } => {
+                let mut data = self.data.write().await;
+                if let Some((origin_id, err)) = e {
                     let track = data.remove_track(&id);
                     tx.send(origin_id, Event::DownloadError { track, err })?;
                 } else {
-                    data.ready_track(&id);
-                    if matches!(data.first_track_state(), Some(QueuedTrackState::Downloaded)) {
-                        data.queue_player(&self.player).await?;
-                    }
+                    data.unready_track(&id);
                 }
-            }
-            ManagerEvent::Removed { id } => {
-                let mut data = self.data.write().await;
-                data.unready_track(&id);
             }
         }
         Ok(())

@@ -12,15 +12,11 @@ pub struct Cli {
     #[arg(long, short = 'C', env = "APP_DOWNLOAD_DIR", default_value = "data")]
     pub download_dir: Utf8PathBuf,
     /// Admin server Unix socket
-    #[arg(
-        long,
-        env = "APP_UNIX_SOCKET_PATH",
-        default_value = "music-server.sock"
-    )]
-    pub unix_socket_path: Utf8PathBuf,
+    #[arg(long, env = "APP_UNIX_SOCKET_PATH")]
+    pub unix_socket_path: Option<Utf8PathBuf>,
     /// Telegram bot token
     #[arg(long, env = "APP_TELEGRAM_BOT_TOKEN")]
-    pub telegram_bot_token: String,
+    pub telegram_bot_token: Option<String>,
     /// Youtube downloader workers
     #[arg(long, env = "APP_YOUTUBE_WORKERS", default_value = "2")]
     pub youtube_workers: usize,

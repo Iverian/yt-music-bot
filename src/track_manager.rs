@@ -16,12 +16,11 @@ pub struct TrackManager {
 #[derive(Debug, Clone)]
 pub enum Event {
     Acquired {
-        origin_id: OriginId,
         id: TrackId,
-        err: Option<YoutubeError>,
     },
     Removed {
         id: TrackId,
+        e: Option<(OriginId, YoutubeError)>,
     },
 }
 
@@ -33,24 +32,25 @@ type RequestRx = mpsc::UnboundedReceiver<Request>;
 type EventTx = mpsc::UnboundedSender<Event>;
 type EventRx = mpsc::UnboundedReceiver<Event>;
 
-struct Worker {
+#[derive(Clone)]
+struct Worker(Arc<State>);
+
+struct State {
     tx: EventTx,
-    downloader: Youtube,
+    youtube: Youtube,
     cache_size: usize,
-    state: State,
+    data: Mutex<Data>,
 }
 
 #[derive(Default)]
-struct State {
-    tracks: HashMap<TrackId, TrackLock>,
+struct Data {
+    tracks: HashMap<TrackId, TrackData>,
     queue: VecDeque<(OriginId, TrackId)>,
     size: usize,
 }
 
-type TrackLock = Arc<Mutex<TrackState>>;
-
-#[derive(Debug)]
-struct TrackState {
+#[derive(Debug, Default)]
+struct TrackData {
     path: Option<Utf8PathBuf>,
     claims: usize,
 }
@@ -63,15 +63,10 @@ enum Request {
 }
 
 impl TrackManager {
-    pub fn new(downloader: Youtube, cache_size: usize) -> (TrackManager, Receiver) {
+    pub fn new(youtube: Youtube, cache_size: usize) -> (TrackManager, Receiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (etx, erx) = mpsc::unbounded_channel();
-        let w = Worker {
-            tx: etx,
-            downloader,
-            state: State::default(),
-            cache_size: 1 + cache_size,
-        };
+        let w = Worker::new(etx, youtube, cache_size);
         tokio::task::spawn(w.serve_forever(rx));
         (Self { tx }, Receiver(erx))
     }
@@ -93,112 +88,141 @@ impl TrackManager {
 }
 
 impl Worker {
-    async fn serve_forever(mut self, mut rx: RequestRx) {
+    fn new(tx: EventTx, youtube: Youtube, cache_size: usize) -> Self {
+        Self(Arc::new(State {
+            tx,
+            youtube,
+            cache_size: 1 + cache_size,
+            data: Mutex::new(Data::default()),
+        }))
+    }
+    async fn serve_forever(self, mut rx: RequestRx) -> ChannelResult<()> {
         while let Some(req) = rx.recv().await {
-            self.request_handler(req).await;
+            self.request_handler(req).await?;
         }
+        Ok(())
     }
 
-    async fn request_handler(&mut self, req: Request) {
+    async fn request_handler(&self, req: Request) -> ChannelResult<()> {
         tracing::debug!(request = ?req, "track manager request");
         match req {
-            Request::Claim { origin_id, id } => self.claim(origin_id, id).await,
-            Request::Unclaim { id } => self.unclaim(id).await,
-            Request::Clear => self.clear().await,
+            Request::Claim { origin_id, id } => {
+                self.0.claim(origin_id, id).await?;
+            }
+            Request::Unclaim { id } => {
+                self.0.unclaim(id, None).await?;
+            }
+            Request::Clear => {
+                self.0.clear().await;
+            }
         }
+        Ok(())
     }
+}
 
-    async fn claim(&mut self, origin_id: OriginId, id: TrackId) {
-        if let Some(lock) = self.state.tracks.get(&id) {
-            let mut state = lock.lock().await;
-            tracing::info!(track_id = id, state = ?state, "existing claim");
-            state.claim();
-            if state.needs_download() {
-                if self.state.size >= self.cache_size {
-                    self.state.queue.push_back((origin_id, id));
+impl State {
+    async fn claim(self: &Arc<Self>, origin_id: OriginId, id: TrackId) -> ChannelResult<()> {
+        let mut data = self.data.lock().await;
+        if let Some(track) = data.tracks.get_mut(&id) {
+            track.claim();
+            if track.needs_download() {
+                if data.size == self.cache_size {
+                    data.queue.push_back((origin_id, id));
                 } else {
-                    self.state.size += 1;
-                    self.download(origin_id, id, lock.clone());
+                    data.size += 1;
+                    self.download(origin_id, id);
                 }
-            } else if state.present() {
-                self.tx
-                    .send(Event::Acquired {
-                        origin_id,
-                        id,
-                        err: None,
-                    })
-                    .ok();
+            } else if track.present() {
+                self.tx.send(Event::Acquired { id })?;
             }
         } else {
-            let lock = TrackState::new_lock(1);
-            if self.state.size >= self.cache_size {
-                self.state.tracks.insert(id.clone(), lock);
-                self.state.queue.push_back((origin_id, id));
+            let mut track = TrackData::default();
+            track.claim();
+            data.tracks.insert(id.clone(), track);
+            if data.size == self.cache_size {
+                data.queue.push_back((origin_id, id));
             } else {
-                self.state.size += 1;
-                self.state.tracks.insert(id.clone(), lock.clone());
-                self.download(origin_id, id, lock);
+                data.size += 1;
+                self.download(origin_id, id);
             }
         }
+        Ok(())
     }
 
-    async fn unclaim(&mut self, id: TrackId) {
-        let Some(lock) = self.state.tracks.get(&id) else {
-            return;
+    async fn unclaim(
+        self: &Arc<Self>,
+        id: TrackId,
+        e: Option<(OriginId, YoutubeError)>,
+    ) -> ChannelResult<()> {
+        let mut data = self.data.lock().await;
+        let Some(track) = data.tracks.get_mut(&id) else {
+            return Ok(());
         };
-
-        let mut state = lock.lock().await;
-        state.unclaim();
-        if !state.can_remove() {
-            return;
+        track.unclaim();
+        if !track.can_remove() {
+            return Ok(());
         }
+        track.remove().await;
+        data.tracks.remove(&id);
+        self.tx.send(Event::Removed { id, e })?;
 
-        self.tx.send(Event::Removed { id }).ok();
-        state.remove().await;
-
-        if let Some((origin_id, id)) = self.state.queue.pop_front() {
-            let lock = self.state.tracks[&id].clone();
-            self.download(origin_id, id, lock);
+        if let Some((origin_id, id)) = data.queue.pop_front() {
+            self.download(origin_id, id);
         } else {
-            self.state.size -= 1;
+            data.size -= 1;
         }
+
+        Ok(())
     }
 
-    async fn clear(&mut self) {
-        for lock in self.state.tracks.values() {
-            let mut state = lock.lock().await;
-            state.remove().await;
-        }
-        self.state.tracks.clear();
-        self.state.queue.clear();
-        self.state.size = 0;
+    async fn clear(self: &Arc<Self>) {
+        self.data.lock().await.clear();
     }
 
-    fn download(&self, origin_id: OriginId, id: TrackId, lock: TrackLock) {
-        let tx = self.tx.clone();
-        let downloader = self.downloader.clone();
-        tokio::task::spawn(async move {
-            let path = match downloader.download_by_id(&id).await {
-                Ok(x) => x,
-                Err(e) => {
-                    tx.send(Event::Acquired {
-                        origin_id,
-                        id,
-                        err: Some(e),
-                    })
-                    .ok();
-                    return;
-                }
-            };
-            if lock.lock().await.try_set_path(path).await {
-                tx.send(Event::Acquired {
-                    origin_id,
-                    id,
-                    err: None,
-                })
-                .ok();
+    fn download(self: &Arc<Self>, origin_id: OriginId, id: TrackId) {
+        tokio::spawn(self.clone().download_impl(origin_id, id));
+    }
+
+    async fn download_impl(self: Arc<Self>, origin_id: OriginId, id: TrackId) {
+        let path = match self.youtube.download_by_id(&id).await {
+            Ok(x) => x,
+            Err(e) => {
+                self.download_error(origin_id, id, e).await.ok();
+                return;
             }
-        });
+        };
+        let mut data = self.data.lock().await;
+        let track = data.tracks.get_mut(&id).unwrap();
+        track.try_set_path(path).await;
+        self.tx.send(Event::Acquired { id }).ok();
+    }
+
+    async fn download_error(
+        self: &Arc<Self>,
+        origin_id: OriginId,
+        id: TrackId,
+        e: YoutubeError,
+    ) -> ChannelResult<()> {
+        let mut data = self.data.lock().await;
+        data.tracks.remove(&id);
+        if let Some((origin_id, id)) = data.queue.pop_front() {
+            self.download(origin_id, id);
+        } else {
+            data.size -= 1;
+        }
+        self.tx.send(Event::Removed {
+            id,
+            e: Some((origin_id, e)),
+        })?;
+        Ok(())
+    }
+}
+
+impl Data {
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.tracks.clear();
+        self.size = 0;
     }
 }
 
@@ -208,11 +232,7 @@ impl Receiver {
     }
 }
 
-impl TrackState {
-    fn new_lock(claims: usize) -> TrackLock {
-        Arc::new(Mutex::new(TrackState { path: None, claims }))
-    }
-
+impl TrackData {
     fn needs_download(&self) -> bool {
         self.claims <= 1 && self.path.is_none()
     }

@@ -45,8 +45,8 @@ async fn run(cli: Cli) -> AnyResult<()> {
 }
 
 async fn run_inner(
-    unix_socket_path: Utf8PathBuf,
-    telegram_bot_token: String,
+    unix_socket_path: Option<Utf8PathBuf>,
+    telegram_bot_token: Option<String>,
     download_dir: Utf8PathBuf,
     youtube_workers: usize,
     controller_settings: ControllerSettings,
@@ -56,6 +56,7 @@ async fn run_inner(
     let (player, player_receiver) = Player::new().await?;
     let youtube = Youtube::new(download_dir, youtube_workers).await?;
 
+    let mut tasks = Vec::with_capacity(3);
     let (controller, controller_task) = Controller::new(
         token.child_token(),
         player,
@@ -63,18 +64,38 @@ async fn run_inner(
         youtube,
         controller_settings,
     );
-    let bot_task = spawn_bot(token.child_token(), &telegram_bot_token, &controller);
-    let server_task = spawn_server(token.child_token(), unix_socket_path, controller)?;
-    run_tasks(vec![controller_task, server_task, bot_task], token).await
+    tasks.push(controller_task);
+    if let Some(telegram_bot_token) = telegram_bot_token {
+        tracing::info!("starting telegram bot");
+        tasks.push(spawn_bot(
+            token.child_token(),
+            &telegram_bot_token,
+            &controller,
+        ));
+    }
+    if let Some(unix_socket_path) = unix_socket_path {
+        tracing::info!(socket = ?unix_socket_path, "starting admin server");
+        tasks.push(spawn_server(
+            token.child_token(),
+            unix_socket_path,
+            controller,
+        )?);
+    }
+    run_tasks(tasks, token).await
 }
 
 fn main() -> AnyResult<()> {
-    dotenv().ok();
+    let e = dotenv().err();
     let cli = Cli::parse();
     cli.configure_logging();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cli.workers)
         .build()?
-        .block_on(run(cli))
+        .block_on(async move {
+            if let Some(e) = e {
+                tracing::warn!(error = ?e, "error reading dotenv");
+            }
+            run(cli).await
+        })
 }
