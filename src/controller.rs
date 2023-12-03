@@ -583,7 +583,7 @@ impl Data {
         Ok(result)
     }
 
-    fn first_track_state(&self) -> Option<QueuedTrackState> {
+    pub fn first_track_state(&self) -> Option<QueuedTrackState> {
         self.queue
             .first_key_value()
             .map(|(_, v)| self.get_track_state(v, None))
@@ -692,7 +692,10 @@ impl<'a> IntoIterator for &'a Data {
     type IntoIter = DataIterator<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        todo!()
+        DataIterator {
+            parent: self,
+            iter: self.queue.iter(),
+        }
     }
 }
 

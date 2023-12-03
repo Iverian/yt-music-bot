@@ -11,6 +11,7 @@ clap = { version = "4.4.8", features = ["cargo", "env", "derive", "string"] }
 dotenvy = "0.15.7"
 dptree = "0.3.0"
 futures = "0.3.29"
+html-escape = "0.2.13"
 itertools = "0.12.0"
 lru-cache = "0.1.2"
 mimalloc = "0.1.39"
