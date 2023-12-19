@@ -5,3 +5,4 @@ rustflags = ["--cfg", "tracing_unstable", "--cfg", "tokio_unstable"]
 lto = true
 strip = true
 opt-level = 3
+codegen-units = 1

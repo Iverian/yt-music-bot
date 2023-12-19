@@ -1,6 +1,9 @@
 [build]
-default-target = "aarch64-unknown-linux-gnu"
+default-target = "x86_64-unknown-linux-gnu"
 build-std = true
 
+[target.x86_64-unknown-linux-gnu]
+dockerfile = "./cross.x86_64.dockerfile"
+
 [target.aarch64-unknown-linux-gnu]
-dockerfile = "./cross.dockerfile"
+dockerfile = "./cross.aarch64.dockerfile"
