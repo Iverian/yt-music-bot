@@ -72,7 +72,7 @@ class Youtube:
     def __init__(self, download_dir: str, jobs: int = 1, download_timeout_s: int = 15):
         params = self._make_params(download_dir, download_timeout_s)
         self._queue = Queue(maxsize=jobs)
-        self._jobs = [_Worker.spawn(1 + i, self._queue, params) for i in range(jobs)]
+        self._jobs = [_Worker.spawn(self._queue, params) for _ in range(jobs)]
 
     def close(self):
         for _ in self._jobs:
@@ -116,14 +116,13 @@ class _Worker:
         self._download_timeout_s = int(params.get("socket_timeout", 15))
 
     @staticmethod
-    def spawn(worker_id: int, queue: Queue, params: Params) -> Process:
-        process = Process(target=_Worker.run, args=(worker_id, queue, params))
+    def spawn(queue: Queue, params: Params) -> Process:
+        process = Process(target=_Worker.run, args=(queue, params))
         process.start()
         return process
 
     @staticmethod
-    def run(worker_id: int, queue: Queue, params: Params):
-        setproctitle(f"[youtube-download-worker:{worker_id:02d}]")
+    def run(queue: Queue, params: Params):
         worker = _Worker(params)
         try:
             while True:
