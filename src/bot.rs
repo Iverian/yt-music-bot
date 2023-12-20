@@ -27,7 +27,17 @@ use crate::util::cancel::Task;
 use crate::util::parse::{ArgumentList, VolumeCommand};
 use crate::youtube::Track;
 
-pub fn spawn(token: CancellationToken, bot_token: &str, controller: &Controller) -> Task {
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    pub max_request_duration: Duration,
+}
+
+pub fn spawn(
+    token: CancellationToken,
+    bot_token: &str,
+    controller: &Controller,
+    settings: Settings,
+) -> Task {
     let (tx, rx) = controller.subscribe();
     let state = State::new();
     let bot = Bot::new(bot_token);
@@ -35,7 +45,8 @@ pub fn spawn(token: CancellationToken, bot_token: &str, controller: &Controller)
         .dependencies(dptree::deps![
             InMemStorage::<DialogueState>::new(),
             tx,
-            state.clone()
+            state.clone(),
+            settings
         ])
         .build();
 
@@ -254,13 +265,15 @@ async fn queue(
     bot: Bot,
     msg: Message,
     state: State,
+    settings: Settings,
     tx: ControllerSender,
     urls: ArgumentList<Url>,
 ) -> HandlerResult {
     let urls = urls.into_vec();
     bot.send_chat_action(msg.chat.id, ChatAction::Typing)
         .await?;
-    state.request(&msg, tx.queue(urls)).await?;
+    let tracks = filter_tracks(tx.resolve(urls).await?, &settings);
+    state.request(&msg, tx.queue(tracks)).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
@@ -338,6 +351,17 @@ async fn confirm_request(bot: &Bot, msg: &Message) -> HandlerResult {
         .reply_to_message_id(msg.id)
         .await?;
     Ok(())
+}
+
+fn filter_tracks(tracks: Vec<Track>, settings: &Settings) -> Vec<Track> {
+    let mut cur = Duration::ZERO;
+    tracks
+        .into_iter()
+        .take_while(|x| {
+            cur += x.duration;
+            cur <= settings.max_request_duration
+        })
+        .collect()
 }
 
 impl State {
@@ -470,8 +494,8 @@ impl State {
             Event::DownloadError { track, err } => {
                 writeln!(
                     &mut message,
-                    "❗ Ошибка загрузки: {}\n{}",
-                    err,
+                    "❗ Ошибка загрузки\\: {}\n{}",
+                    markdown::escape(&err.to_string()),
                     TrackFmt(&track)
                 )?;
                 if let Some(RequestData {

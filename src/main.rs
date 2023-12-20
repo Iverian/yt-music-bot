@@ -14,20 +14,22 @@ use camino::Utf8PathBuf;
 use dotenvy::dotenv;
 use mimalloc::MiMalloc;
 
-use crate::bot::spawn as spawn_bot;
+use crate::bot::{spawn as spawn_bot, Settings as BotSettings};
 use crate::cli::Cli;
 use crate::controller::{Controller, Settings as ControllerSettings};
-use crate::player::Player;
 use crate::server::spawn as spawn_server;
 use crate::util::cancel::{make_cancel_token, run_tasks};
 use crate::util::temp_dir::TempDir;
-use crate::youtube::Youtube;
+use crate::youtube::{Settings as YoutubeSettings, Youtube};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 async fn run(cli: Cli) -> AnyResult<()> {
     let controller_settings = cli.controller_settings();
+    let bot_settings = cli.bot_settings();
+    let youtube_settings = cli.youtube_settings();
+
     let dir = TempDir::new(cli.download_dir).await?;
     let download_dir = dir.path().to_owned();
 
@@ -35,8 +37,9 @@ async fn run(cli: Cli) -> AnyResult<()> {
         cli.unix_socket_path,
         cli.telegram_bot_token,
         download_dir,
-        cli.youtube_workers,
         controller_settings,
+        bot_settings,
+        youtube_settings,
     )
     .await;
 
@@ -48,22 +51,19 @@ async fn run_inner(
     unix_socket_path: Option<Utf8PathBuf>,
     telegram_bot_token: Option<String>,
     download_dir: Utf8PathBuf,
-    youtube_workers: usize,
     controller_settings: ControllerSettings,
+    bot_settings: BotSettings,
+    youtube_settings: YoutubeSettings,
 ) -> AnyResult<()> {
     let token = make_cancel_token().await;
-
-    let (player, player_receiver) = Player::new().await?;
-    let youtube = Youtube::new(download_dir, youtube_workers).await?;
 
     let mut tasks = Vec::with_capacity(3);
     let (controller, controller_task) = Controller::new(
         token.child_token(),
-        player,
-        player_receiver,
-        youtube,
+        Youtube::new(download_dir, youtube_settings).await?,
         controller_settings,
-    );
+    )
+    .await?;
     tasks.push(controller_task);
     if let Some(telegram_bot_token) = telegram_bot_token {
         tracing::info!("starting telegram bot");
@@ -71,6 +71,7 @@ async fn run_inner(
             token.child_token(),
             &telegram_bot_token,
             &controller,
+            bot_settings,
         ));
     }
     if let Some(unix_socket_path) = unix_socket_path {

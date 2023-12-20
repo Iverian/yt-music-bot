@@ -334,7 +334,8 @@ impl Connection {
             .iter()
             .map(|x| x.parse().map_err(|_| Error::InvalidYoutubeUrl(x.clone())))
             .try_collect()?;
-        self.tx.queue(urls).await?;
+        let tracks = self.tx.resolve(urls).await?;
+        self.tx.queue(tracks).await?;
         Ok(())
     }
 

@@ -1,9 +1,13 @@
+use std::time::Duration;
+
 use camino::Utf8PathBuf;
 use clap::Parser;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 
+use crate::bot::Settings as BotSettings;
 use crate::controller::Settings as ControllerSettings;
+use crate::youtube::Settings as YoutubeSettings;
 
 /// Youtube music bot
 #[derive(Debug, Parser)]
@@ -20,6 +24,9 @@ pub struct Cli {
     /// Youtube downloader workers
     #[arg(long, env = "APP_YOUTUBE_WORKERS", default_value = "2")]
     pub youtube_workers: usize,
+    /// Youtube download timeout in seconds
+    #[arg(long, default_value = "30", env = "APP_YOUTUBE_DOWNLOAD_TIMEOUT_S")]
+    pub youtube_download_timeout_s: u64,
     /// Runtime worker threads
     #[arg(long, short = 'w', env = "APP_WORKERS", default_value_t = Self::default_workers())]
     pub workers: usize,
@@ -29,6 +36,13 @@ pub struct Cli {
     /// Start playback automatically after adding tracks to empty queue
     #[arg(long, env = "APP_AUTO_PLAY")]
     auto_play: bool,
+    /// Maximum track duration for telegram bot
+    #[arg(
+        long,
+        default_value = "3600",
+        env = "APP_TELEGRAM_BOT_REQUEST_MAX_DURATION_S"
+    )]
+    bot_request_max_duration_s: u64,
     /// Logging level
     #[arg(long, env = "APP_LOG_LEVEL", default_value = "INFO")]
     log_level: LevelFilter,
@@ -46,6 +60,19 @@ impl Cli {
         ControllerSettings {
             auto_play: self.auto_play,
             track_cache_size: self.track_cache_size,
+        }
+    }
+
+    pub fn bot_settings(&self) -> BotSettings {
+        BotSettings {
+            max_request_duration: Duration::from_secs(self.bot_request_max_duration_s),
+        }
+    }
+
+    pub fn youtube_settings(&self) -> YoutubeSettings {
+        YoutubeSettings {
+            jobs: self.youtube_workers,
+            download_timeout: Duration::from_secs(self.youtube_download_timeout_s),
         }
     }
 

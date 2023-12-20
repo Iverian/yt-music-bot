@@ -32,10 +32,17 @@ static BASE_URL: Lazy<Url> = Lazy::new(|| "https://www.youtube.com/watch".parse(
 static ERROR_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^ERROR: \[.*\] (.+)$").unwrap());
 
 pub type Result<T> = core::result::Result<T, Error>;
+pub type TrackId = String;
 
 #[derive(Debug, Clone)]
 pub struct Youtube {
     tx: RequestTx,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    pub jobs: usize,
+    pub download_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -49,8 +56,6 @@ pub enum Error {
     #[error(transparent)]
     Channel(#[from] ChannelError),
 }
-
-pub type TrackId = String;
 
 #[derive(Debug, Clone)]
 pub struct Track {
@@ -113,10 +118,10 @@ struct Worker<'a> {
 }
 
 impl Youtube {
-    pub async fn new(download_dir: Utf8PathBuf, jobs: usize) -> AnyResult<Self> {
-        let (tx, rx) = mpsc::channel(jobs);
+    pub async fn new(download_dir: Utf8PathBuf, settings: Settings) -> AnyResult<Self> {
+        let (tx, rx) = mpsc::channel(settings.jobs);
         let (stx, srx) = oneshot::channel();
-        thread::spawn(move || Worker::run(stx, rx, &download_dir, jobs));
+        thread::spawn(move || Worker::run(stx, rx, &download_dir, settings));
         srx.await??;
         Ok(Self { tx })
     }
@@ -211,9 +216,9 @@ impl<'a> Worker<'a> {
 }
 
 impl Worker<'_> {
-    fn run(stx: StartupTx, rx: RequestRx, download_dir: &Utf8Path, jobs: usize) {
+    fn run(stx: StartupTx, rx: RequestRx, download_dir: &Utf8Path, settings: Settings) {
         Python::with_gil(|py| {
-            let server = match Self::load_python_code(py, download_dir, jobs) {
+            let server = match Self::load_python_code(py, download_dir, settings) {
                 Ok(x) => x,
                 Err(e) => {
                     stx.send(Err(e.into())).unwrap();
@@ -230,11 +235,15 @@ impl Worker<'_> {
     fn load_python_code<'b>(
         py: Python<'b>,
         download_dir: &Utf8Path,
-        jobs: usize,
+        settings: Settings,
     ) -> PyResult<&'b PyAny> {
         let module = PyModule::from_code(py, &PYTHON_CODE, PYTHON_FILE, PYTHON_MODULE).unwrap();
         let server_class = module.getattr(intern!(py, PYTHON_CLASS)).unwrap();
-        let server = server_class.call1((download_dir.as_str(), jobs))?;
+        let server = server_class.call1((
+            download_dir.as_str(),
+            settings.jobs,
+            settings.download_timeout.as_secs(),
+        ))?;
         Ok(server)
     }
 }

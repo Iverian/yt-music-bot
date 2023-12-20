@@ -5,7 +5,6 @@ from multiprocessing import Pipe, Process, Queue
 from multiprocessing.connection import Connection
 from typing import Any, List, Mapping, Optional, Union
 
-from setproctitle import setproctitle
 from yt_dlp import YoutubeDL
 
 YOUTUBE_DL_OUTPUT_TEMPLATE = "%(id)s.%(ext)s"
@@ -69,7 +68,12 @@ class Youtube:
     _queue: Queue
     _jobs: List[Process]
 
-    def __init__(self, download_dir: str, jobs: int = 1, download_timeout_s: int = 15):
+    def __init__(
+        self,
+        download_dir: str,
+        jobs: int,
+        download_timeout_s: int,
+    ):
         params = self._make_params(download_dir, download_timeout_s)
         self._queue = Queue(maxsize=jobs)
         self._jobs = [_Worker.spawn(self._queue, params) for _ in range(jobs)]

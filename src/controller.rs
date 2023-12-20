@@ -151,16 +151,15 @@ struct Broadcast(EventTx);
 struct BroadcastProxy<'a>(&'a EventTx, OriginId);
 
 impl Controller {
-    pub fn new(
+    pub async fn new(
         token: CancellationToken,
-        player: Player,
-        player_receiver: PlayerReceiver,
         youtube: Youtube,
         settings: Settings,
-    ) -> (Self, Task) {
+    ) -> AnyResult<(Self, Task)> {
         let (tx, _) = broadcast::channel(BROADCAST_QUEUE_SIZE);
         let (manager, manager_receiver) =
             TrackManager::new(youtube.clone(), settings.track_cache_size);
+        let (player, player_receiver) = Player::new().await?;
         let state = State::new(player, manager, youtube, settings.auto_play);
 
         let controller = Self {
@@ -175,7 +174,7 @@ impl Controller {
             manager_receiver,
         ));
 
-        (controller, task)
+        Ok((controller, task))
     }
 
     pub fn subscribe(&self) -> (Sender, Receiver) {
@@ -190,16 +189,14 @@ impl Controller {
 }
 
 impl Sender {
-    pub async fn queue(&self, urls: Vec<Url>) -> Result<OriginId> {
-        let tracks = self
-            .state
-            .youtube
-            .resolve(urls)
-            .await
-            .map_err(|e| match e {
-                YoutubeError::Channel(e) => Error::Channel(e),
-                e => Error::Youtube(e),
-            })?;
+    pub async fn resolve(&self, urls: Vec<Url>) -> Result<Vec<Track>> {
+        self.state.youtube.resolve(urls).await.map_err(|e| match e {
+            YoutubeError::Channel(e) => Error::Channel(e),
+            e => Error::Youtube(e),
+        })
+    }
+
+    pub async fn queue(&self, tracks: Vec<Track>) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         let tracks = self.state.queue(origin_id, tracks).await?;
         self.tx.send(origin_id, Event::TracksQueued { tracks })?;
