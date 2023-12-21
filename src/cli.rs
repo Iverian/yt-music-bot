@@ -43,6 +43,9 @@ pub struct Cli {
         env = "APP_TELEGRAM_BOT_REQUEST_MAX_DURATION_S"
     )]
     bot_request_max_duration_s: u64,
+    /// Allow only music tracks recognized by Youtube
+    #[arg(long, env = "APP_TELEGRAM_BOT_ONLY_MUSIC_TRACKS")]
+    bot_only_music_tracks: bool,
     /// Logging level
     #[arg(long, env = "APP_LOG_LEVEL", default_value = "INFO")]
     log_level: LevelFilter,
@@ -66,6 +69,7 @@ impl Cli {
     pub fn bot_settings(&self) -> BotSettings {
         BotSettings {
             max_request_duration: Duration::from_secs(self.bot_request_max_duration_s),
+            only_music_tracks: self.bot_only_music_tracks,
         }
     }
 

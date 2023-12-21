@@ -64,6 +64,7 @@ pub struct Track {
     pub artist: Vec<String>,
     pub webpage_url: Url,
     pub duration: Duration,
+    pub is_music_track: bool,
     pub path: Utf8PathBuf,
 }
 
@@ -87,6 +88,7 @@ struct TrackRaw {
     artist: Vec<String>,
     webpage_url: String,
     duration_s: u64,
+    is_music_track: bool,
     path: String,
 }
 
@@ -273,6 +275,7 @@ impl From<TrackRaw> for Track {
             artist: value.artist,
             webpage_url: value.webpage_url.parse().unwrap(),
             duration: Duration::from_secs(value.duration_s),
+            is_music_track: value.is_music_track,
             path: value.path.parse().unwrap(),
         }
     }

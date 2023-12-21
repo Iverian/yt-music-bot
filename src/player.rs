@@ -11,7 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::util::channel::ChannelError;
 
-pub const MAX_VOLUME: u8 = 10;
+pub const MIN_VOLUME: u8 = 1;
+pub const MAX_VOLUME: u8 = 20;
 
 pub type Result<T> = core::result::Result<T, Error>;
 pub type EventTx = mpsc::UnboundedSender<Event>;
@@ -252,7 +253,7 @@ impl Worker {
     }
 
     fn set_volume_handler(&mut self, origin_id: OriginId, level: u8) -> Result<()> {
-        if level > MAX_VOLUME {
+        if !(MIN_VOLUME..=MAX_VOLUME).contains(&level) {
             return Err(Error::InvalidVolumeLevel);
         }
         self.volume_level = level;
@@ -370,11 +371,11 @@ where
 }
 
 fn level_to_volume(level: u8) -> f32 {
-    f32::from(level) / 10.
+    f32::from(level) / f32::from(MAX_VOLUME)
 }
 
 fn change_level(level: u8, modifier: i8) -> u8 {
-    if (level == 0 && modifier < 0) || (level == MAX_VOLUME && modifier > 0) {
+    if (level == MIN_VOLUME && modifier < 0) || (level == MAX_VOLUME && modifier > 0) {
         return level;
     }
     level.wrapping_add_signed(modifier)

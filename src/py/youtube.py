@@ -49,6 +49,7 @@ class Track:
     artist: List[str]
     webpage_url: str
     duration_s: int
+    is_music_track: bool
     path: str
 
 
@@ -200,11 +201,13 @@ class _Worker:
 
     def _get_track(self, data: Mapping[str, Any]) -> Track:
         title = None
+        is_music_track = False
         artist = []
         if "track" in data and "artist" in data:
             title = str(data["track"])
             # В некоторых треках Youtube отдает список артистов через запятую
             artist = [i.strip() for i in str(data["artist"]).split(",")]
+            is_music_track = True
         else:
             title = str(data["title"])
 
@@ -214,6 +217,7 @@ class _Worker:
             artist=artist,
             webpage_url=str(data["webpage_url"]),
             duration_s=int(data["duration"]),
+            is_music_track=is_music_track,
             path=str(self._yt.prepare_filename(data)),
         )
 

@@ -30,6 +30,7 @@ use crate::youtube::Track;
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
     pub max_request_duration: Duration,
+    pub only_music_tracks: bool,
 }
 
 pub fn spawn(
@@ -357,6 +358,7 @@ fn filter_tracks(tracks: Vec<Track>, settings: &Settings) -> Vec<Track> {
     let mut cur = Duration::ZERO;
     tracks
         .into_iter()
+        .filter(|x| !settings.only_music_tracks || x.is_music_track)
         .take_while(|x| {
             cur += x.duration;
             cur <= settings.max_request_duration
