@@ -3,6 +3,7 @@ use std::io;
 use std::pin::pin;
 
 use anyhow::Result as AnyResult;
+use async_stream::try_stream;
 use camino::Utf8PathBuf;
 use futures::stream::once;
 use futures::{stream_select, FutureExt, Stream};
@@ -524,7 +525,7 @@ impl From<ControllerError> for Error {
 }
 
 fn accept_stream(listener: UnixListener) -> impl Stream<Item = io::Result<UnixStream>> {
-    async_stream::try_stream! {
+    try_stream! {
         loop {
             let (stream, _) = listener.accept().await?;
             yield stream;
