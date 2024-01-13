@@ -1,11 +1,13 @@
 #![allow(clippy::unused_async)]
 use std::collections::HashSet;
 use std::fmt::{Display, Write};
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Error as AnyError, Result as AnyResult};
-use futures::Future;
+use futures::stream::once;
+use futures::{stream_select, Future, FutureExt, StreamExt};
 use lru_cache::LruCache;
 use teloxide::dispatching::dialogue::{self, InMemStorage};
 use teloxide::dispatching::{Dispatcher, UpdateHandler};
@@ -19,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::controller::{
-    Controller, Event, QueuedTrackState, Receiver as ControllerReceiver,
+    Controller, Event, EventWrapper, QueuedTrackState, Receiver as ControllerReceiver,
     Sender as ControllerSender, Status,
 };
 use crate::player::OriginId;
@@ -128,7 +130,6 @@ struct StateData {
 struct RequestData {
     chat_id: ChatId,
     message_id: MessageId,
-    // username: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,12 @@ struct TrackFmt<'a>(&'a Track);
 struct DurationFmt<'a>(&'a Duration);
 
 struct StatusFmt<'a>(&'a Status);
+
+#[allow(clippy::large_enum_variant)]
+enum MergedEvent {
+    Controller(EventWrapper),
+    Cancel,
+}
 
 fn schema() -> UpdateHandler<AnyError> {
     use dptree::case;
@@ -402,22 +409,28 @@ impl State {
         self,
         token: CancellationToken,
         bot: Bot,
-        mut rx: ControllerReceiver,
+        rx: ControllerReceiver,
     ) -> AnyResult<()> {
         tracing::info!("sending bot notifications to telegram");
-        loop {
-            tokio::select! {
-                r = rx.recv_wrapped() => {
-                    let Some(e) = r else {
-                        break;
-                    };
-                    self.notification_handler(e.origin_id, e.event, &bot).await?;
+
+        let cancel = pin!(token.cancelled_owned().fuse());
+        let mut stream = stream_select!(
+            rx.wrap().map(MergedEvent::Controller),
+            once(cancel).map(|()| MergedEvent::Cancel),
+        );
+
+        while let Some(x) = stream.next().await {
+            match x {
+                MergedEvent::Controller(x) => {
+                    self.notification_handler(x.origin_id, x.event, &bot)
+                        .await?;
                 }
-                () = token.cancelled() => {
+                MergedEvent::Cancel => {
                     break;
                 }
             }
         }
+
         Ok(())
     }
 

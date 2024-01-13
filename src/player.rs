@@ -8,6 +8,7 @@ use rodio::source::EmptyCallback;
 use rodio::{Decoder, OutputStream, Sink};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::util::channel::ChannelError;
 
@@ -16,18 +17,15 @@ pub const MAX_VOLUME: u8 = 20;
 
 pub type Result<T> = core::result::Result<T, Error>;
 pub type EventTx = mpsc::UnboundedSender<Event>;
-pub type EventRx = mpsc::UnboundedReceiver<Event>;
 pub type OriginId = usize;
 pub type QueueId = usize;
 pub type Response = Option<Status>;
+pub type Receiver = UnboundedReceiverStream<Event>;
 
 #[derive(Debug)]
 pub struct Player {
     tx: RequestTx,
 }
-
-#[derive(Debug)]
-pub struct Receiver(EventRx);
 
 #[derive(Debug, Clone, Error)]
 pub enum Error {
@@ -112,7 +110,7 @@ impl Player {
         let (stx, srx) = oneshot::channel();
         thread::spawn(move || Worker::run(stx, etx, rx));
         srx.await??;
-        Ok((Self { tx }, Receiver(erx)))
+        Ok((Self { tx }, Receiver::new(erx)))
     }
 
     pub async fn request(&self, origin_id: OriginId, payload: Request) -> Result<Response> {
@@ -126,12 +124,6 @@ impl Player {
             .map_err(|_| ChannelError)?;
         let r = rx.await.map_err(|_| ChannelError)??;
         Ok(r)
-    }
-}
-
-impl Receiver {
-    pub async fn recv(&mut self) -> Option<Event> {
-        self.0.recv().await
     }
 }
 

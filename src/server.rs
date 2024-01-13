@@ -1,14 +1,18 @@
 use std::fmt::Display;
 use std::io;
+use std::pin::pin;
 
 use anyhow::Result as AnyResult;
 use camino::Utf8PathBuf;
+use futures::stream::once;
+use futures::{stream_select, FutureExt, Stream};
 use itertools::Itertools;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::controller::{
@@ -102,6 +106,11 @@ struct WriterWorker {
     writer: BufWriter<OwnedWriteHalf>,
 }
 
+enum ListenEvent {
+    Accept(UnixStream),
+    Cancel,
+}
+
 struct TrackFmt<'a>(&'a Track);
 
 impl Server {
@@ -112,19 +121,27 @@ impl Server {
     }
 
     async fn serve_forever_impl(self, listener: UnixListener) -> AnyResult<()> {
-        loop {
-            tokio::select! {
-                r = listener.accept() => {
-                    let (stream, _) = r?;
+        let cancel = pin!(self.token.cancelled().fuse());
+        let accept = pin!(accept_stream(listener).map(|x| x.map(ListenEvent::Accept)));
+        let mut stream = stream_select!(
+            accept,
+            once(cancel).map(|()| Ok(ListenEvent::Cancel) as io::Result<_>)
+        );
+
+        while let Some(x) = stream.next().await {
+            match x? {
+                ListenEvent::Accept(stream) => {
                     tracing::info!("accepted connection");
                     Connection::spawn(self.token.child_token(), &self.controller, stream);
                 }
-                () = self.token.cancelled() => {
+                ListenEvent::Cancel => {
                     tracing::info!("admin server shutdown");
-                    return Ok(());
+                    break;
                 }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -368,7 +385,7 @@ impl Connection {
     }
 
     async fn serve_notifications(mut rx: ControllerReceiver, wrt: Writer) {
-        while let Some(e) = rx.recv().await {
+        while let Some(e) = rx.next().await {
             if Self::handle_notification(e, &wrt).is_err() {
                 break;
             }
@@ -502,6 +519,15 @@ impl From<ControllerError> for Error {
             ControllerError::Youtube(e) => Error::Youtube(e),
             ControllerError::Channel(e) => Error::Channel(e),
             ControllerError::Player(e) => Error::Player(e),
+        }
+    }
+}
+
+fn accept_stream(listener: UnixListener) -> impl Stream<Item = io::Result<UnixStream>> {
+    async_stream::try_stream! {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            yield stream;
         }
     }
 }

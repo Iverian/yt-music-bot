@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use tokio::sync::{mpsc, Mutex};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::player::OriginId;
 use crate::util::channel::ChannelResult;
 use crate::youtube::{Error as YoutubeError, TrackId, Youtube};
+
+pub type Receiver = UnboundedReceiverStream<Event>;
 
 #[derive(Debug)]
 pub struct TrackManager {
@@ -24,13 +27,9 @@ pub enum Event {
     },
 }
 
-#[derive(Debug)]
-pub struct Receiver(EventRx);
-
 type RequestTx = mpsc::UnboundedSender<Request>;
 type RequestRx = mpsc::UnboundedReceiver<Request>;
 type EventTx = mpsc::UnboundedSender<Event>;
-type EventRx = mpsc::UnboundedReceiver<Event>;
 
 #[derive(Clone)]
 struct Worker(Arc<State>);
@@ -68,7 +67,7 @@ impl TrackManager {
         let (etx, erx) = mpsc::unbounded_channel();
         let w = Worker::new(etx, youtube, cache_size);
         tokio::task::spawn(w.serve_forever(rx));
-        (Self { tx }, Receiver(erx))
+        (Self { tx }, Receiver::new(erx))
     }
 
     pub fn claim(&self, origin_id: OriginId, id: TrackId) -> ChannelResult<()> {
@@ -219,12 +218,6 @@ impl Data {
         self.queue.clear();
         self.tracks.clear();
         self.size = 0;
-    }
-}
-
-impl Receiver {
-    pub async fn recv(&mut self) -> Option<Event> {
-        self.0.recv().await
     }
 }
 

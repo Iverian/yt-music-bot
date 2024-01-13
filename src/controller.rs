@@ -1,12 +1,18 @@
 use std::collections::btree_map::Iter as BTreeIter;
 use std::collections::BTreeMap;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use anyhow::Result as AnyResult;
 use atomic_counter::{AtomicCounter, ConsistentCounter, RelaxedCounter};
+use futures::stream::once;
+use futures::{ready, stream_select, FutureExt, Stream, StreamExt};
 use itertools::Itertools;
+use pin_project::pin_project;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -60,9 +66,6 @@ pub struct Status {
     pub length: usize,
     pub now_playing: Option<Track>,
 }
-
-#[derive(Debug)]
-pub struct Receiver(EventRx);
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -131,6 +134,14 @@ pub struct QueueData {
     origin_id: OriginId,
 }
 
+#[derive(Debug)]
+#[pin_project]
+pub struct Receiver(#[pin] BroadcastStream<EventWrapper>);
+
+#[derive(Debug)]
+#[pin_project]
+pub struct ReceiverWrapped(#[pin] BroadcastStream<EventWrapper>);
+
 type EventTx = broadcast::Sender<EventWrapper>;
 type EventRx = broadcast::Receiver<EventWrapper>;
 type Map<K, V> = BTreeMap<K, V>;
@@ -149,6 +160,12 @@ struct State {
 struct Broadcast(EventTx);
 
 struct BroadcastProxy<'a>(&'a EventTx, OriginId);
+
+enum MergedEvent {
+    Player(PlayerEvent),
+    Manager(ManagerEvent),
+    Cancel,
+}
 
 impl Controller {
     pub async fn new(
@@ -183,8 +200,52 @@ impl Controller {
                 tx: Broadcast(self.tx.clone()),
                 state: self.state.clone(),
             },
-            Receiver(self.tx.subscribe()),
+            Receiver::new(self.tx.subscribe()),
         )
+    }
+}
+
+impl Receiver {
+    fn new(rx: EventRx) -> Self {
+        Self(BroadcastStream::new(rx))
+    }
+
+    pub fn wrap(self) -> ReceiverWrapped {
+        ReceiverWrapped(self.0)
+    }
+}
+
+impl Stream for Receiver {
+    type Item = Event;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match ready!(self.project().0.poll_next(cx)) {
+            Some(x) => match x {
+                Ok(x) => Poll::Ready(Some(x.event)),
+                Err(_) => Poll::Pending,
+            },
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+impl Stream for ReceiverWrapped {
+    type Item = EventWrapper;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match ready!(self.project().0.poll_next(cx)) {
+            Some(x) => match x {
+                Ok(x) => Poll::Ready(Some(x)),
+                Err(_) => Poll::Pending,
+            },
+            None => Poll::Ready(None),
+        }
     }
 }
 
@@ -347,16 +408,6 @@ impl<'a> BroadcastProxy<'a> {
     }
 }
 
-impl Receiver {
-    pub async fn recv(&mut self) -> Option<Event> {
-        self.0.recv().await.ok().map(|x| x.event)
-    }
-
-    pub async fn recv_wrapped(&mut self) -> Option<EventWrapper> {
-        self.0.recv().await.ok()
-    }
-}
-
 impl State {
     fn new(player: Player, manager: TrackManager, youtube: Youtube, auto_play: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -383,29 +434,30 @@ impl State {
         &self,
         token: CancellationToken,
         tx: Broadcast,
-        mut prx: PlayerReceiver,
-        mut mrx: ManagerReceiver,
+        prx: PlayerReceiver,
+        mrx: ManagerReceiver,
     ) -> AnyResult<()> {
-        loop {
-            tokio::select! {
-                oe = prx.recv() => {
-                    let Some(e) = oe else {
-                        break;
-                    };
-                    self.handle_player_event(&tx, e).await?;
+        let cancel = pin!(token.cancelled_owned().fuse());
+        let mut stream = stream_select!(
+            prx.map(MergedEvent::Player),
+            mrx.map(MergedEvent::Manager),
+            once(cancel).map(|()| MergedEvent::Cancel),
+        );
 
+        while let Some(e) = stream.next().await {
+            match e {
+                MergedEvent::Player(e) => {
+                    self.handle_player_event(&tx, e).await?;
                 }
-                oe = mrx.recv() => {
-                    let Some(e) = oe else {
-                        break;
-                    };
+                MergedEvent::Manager(e) => {
                     self.handle_track_manager_event(&tx, e).await?;
                 }
-                () = token.cancelled() => {
-                    return Ok(());
+                MergedEvent::Cancel => {
+                    break;
                 }
-            };
+            }
         }
+
         Ok(())
     }
 
