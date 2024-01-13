@@ -1,6 +1,7 @@
 use std::io;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use rand::Rng;
 
 const ALPHABET: &[char] = &[
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
@@ -41,12 +42,9 @@ impl TempDir {
     }
 
     fn make_name() -> String {
+        let mut rng = rand::thread_rng();
         let mut result = "tmp".to_owned();
-        result.reserve(WORD_LENGTH);
-        for _ in 0..WORD_LENGTH {
-            let index = rand::random::<usize>() % ALPHABET.len();
-            result.push(ALPHABET[index]);
-        }
+        result.extend((0..WORD_LENGTH).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())]));
         result
     }
 }
