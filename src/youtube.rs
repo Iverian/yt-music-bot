@@ -24,7 +24,12 @@ const PYTHON_RESOLVE_METHOD: &str = "resolve";
 const PYTHON_DOWNLOAD_METHOD: &str = "download";
 const PYTHON_CLOSE_METHOD: &str = "close";
 
-const HOSTS: &[&str] = &["youtu.be", "youtube.com", "www.youtube.com"];
+const HOSTS: &[&str] = &[
+    "youtu.be",
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+];
 
 static PYTHON_CODE: Lazy<String> =
     Lazy::new(|| String::from_utf8(PythonFiles::get(PYTHON_FILE).unwrap().data.to_vec()).unwrap());

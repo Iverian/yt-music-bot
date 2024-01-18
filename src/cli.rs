@@ -5,12 +5,13 @@ use clap::Parser;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 
-use crate::bot::Settings as BotSettings;
 use crate::controller::Settings as ControllerSettings;
+use crate::telegram::Settings as BotSettings;
 use crate::youtube::Settings as YoutubeSettings;
 
 /// Youtube music bot
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     /// Download dir
     #[arg(long, short = 'C', env = "APP_DOWNLOAD_DIR", default_value = "data")]
@@ -52,6 +53,9 @@ pub struct Cli {
     /// Format logs as json
     #[arg(long, env = "APP_LOG_USE_JSON")]
     log_use_json: bool,
+    /// Enable tokio console
+    #[arg(long, env = "APP_LOG_USE_CONSOLE")]
+    log_use_console: bool,
 }
 
 impl Cli {
@@ -80,20 +84,30 @@ impl Cli {
         }
     }
 
-    pub fn configure_logging(&self) {
-        let r = tracing_subscriber::registry().with(if self.log_use_json {
+    pub fn configure(&self) {
+        let log = if self.log_use_json {
             tracing_subscriber::fmt::layer()
                 .json()
+                .with_writer(std::io::stderr)
                 .with_filter(self.log_level)
                 .boxed()
         } else {
             tracing_subscriber::fmt::layer()
                 .compact()
                 .without_time()
+                .with_writer(std::io::stderr)
                 .with_filter(self.log_level)
                 .boxed()
-        });
-        r.init();
+        };
+
+        if self.log_use_console {
+            tracing_subscriber::registry()
+                .with(log)
+                .with(console_subscriber::spawn())
+                .init();
+        } else {
+            tracing_subscriber::registry().with(log).init();
+        }
     }
 
     fn default_workers() -> usize {

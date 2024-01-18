@@ -9,6 +9,8 @@ async-stream = "0.3.5"
 atomic-counter = "1.0.1"
 camino = "1.1.6"
 clap = { version = "4.4.8", features = ["cargo", "env", "derive", "string"] }
+console-subscriber = { version = "0.2.0", default-features = false, features = ["parking_lot"] }
+dashmap = "5.5.3"
 dotenvy = "0.15.7"
 dptree = "0.3.0"
 futures = "0.3.29"
@@ -48,10 +50,5 @@ tokio = { version = "1.34.0", features = [
 tokio-stream = { version = "0.1.14", features = ["sync"] }
 tokio-util = { version = "0.7.10", features = ["tracing"] }
 tracing = { version = "0.1.40", features = ["log", "valuable", "async-await"] }
-tracing-subscriber = { version = "0.3.18", features = [
-  "valuable",
-  "parking_lot",
-  "tracing",
-  "json",
-] }
+tracing-subscriber = { version = "0.3.18", features = ["valuable", "parking_lot", "tracing", "json"] }
 url = { version = "2.4.1", features = ["serde"] }

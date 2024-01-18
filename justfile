@@ -12,6 +12,9 @@ list:
 connect:
   nc -U music-server.sock
 
+python-install:
+  poetry install --no-root
+
 run *OPTS:
   RUST_BACKTRACE=1 poetry run -- cargo run {{ OPTS }}
 
