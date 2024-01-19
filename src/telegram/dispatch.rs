@@ -9,7 +9,6 @@ use teloxide::macros::BotCommands;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, Message, ParseMode};
 use teloxide::utils::command::BotCommands as _;
-use teloxide::utils::markdown;
 use teloxide::{filter_command, Bot};
 use url::Url;
 
@@ -214,12 +213,7 @@ async fn queue_impl(
     let tracks = match tx.resolve(urls).await {
         Ok(x) => x,
         Err(e) => {
-            reply(
-                &bot,
-                &msg,
-                format!("Ошибка: {}", markdown::escape(&e.to_string())),
-            )
-            .await?;
+            reply(&bot, &msg, format!("❗ Ошибка поиска: {e}")).await?;
             return Ok(());
         }
     };
@@ -251,9 +245,7 @@ async fn queue_impl(
 
 async fn status(bot: Bot, msg: Message, tx: ControllerSender) -> HandlerResult {
     let status = tx.status().await?;
-    bot.send_message(msg.chat.id, format!("{}", StatusFmt(&status)))
-        .reply_to_message_id(msg.id)
-        .await?;
+    reply_md(&bot, &msg, StatusFmt(&status).to_string()).await?;
     Ok(())
 }
 
@@ -331,6 +323,17 @@ where
     S: Into<String>,
 {
     bot.send_message(msg.chat.id, text)
+        .reply_to_message_id(msg.id)
+        .await?;
+    Ok(())
+}
+
+async fn reply_md<S>(bot: &Bot, msg: &Message, text: S) -> HandlerResult
+where
+    S: Into<String>,
+{
+    bot.send_message(msg.chat.id, text)
+        .parse_mode(ParseMode::MarkdownV2)
         .reply_to_message_id(msg.id)
         .await?;
     Ok(())
