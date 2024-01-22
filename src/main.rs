@@ -29,7 +29,7 @@ fn main() -> AnyResult<()> {
         .build()?
         .block_on(async move {
             if let Some(e) = e {
-                tracing::warn!(error = ?e, "error reading dotenv");
+                tracing::debug!(error = ?e, "error reading dotenv");
             }
             run::run(cli).await
         })

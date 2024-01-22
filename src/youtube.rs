@@ -29,6 +29,7 @@ const HOSTS: &[&str] = &[
     "youtube.com",
     "www.youtube.com",
     "m.youtube.com",
+    "music.youtube.com",
 ];
 
 static PYTHON_CODE: Lazy<String> =
