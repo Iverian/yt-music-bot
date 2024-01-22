@@ -4,6 +4,7 @@ use std::thread;
 
 use anyhow::Result as AnyResult;
 use camino::Utf8PathBuf;
+use once_cell::sync::Lazy;
 use rodio::source::EmptyCallback;
 use rodio::{Decoder, OutputStream, Sink};
 use thiserror::Error;
@@ -82,6 +83,13 @@ pub enum Request {
     Queue { id: QueueId, path: Utf8PathBuf },
     Status,
 }
+
+static VOLUME_LEVELS: Lazy<Vec<f32>> = Lazy::new(|| {
+    let r = f32::from(MAX_VOLUME - MIN_VOLUME + 1);
+    (MIN_VOLUME..=MAX_VOLUME)
+        .map(|x| ((f32::from(x) + r) / r).log2())
+        .collect()
+});
 
 type RequestTx = mpsc::UnboundedSender<RequestEnvelope>;
 type RequestRx = mpsc::UnboundedReceiver<RequestEnvelope>;
@@ -227,6 +235,7 @@ impl Worker {
 
     fn queue_handler(&mut self, origin_id: OriginId, path: Utf8PathBuf, id: usize) -> Result<()> {
         let track = open_track(path).map_err(|_| Error::InvalidTrack)?;
+
         self.send(origin_id, EventKind::TrackAdded(id));
         self.sink
             .append(cb_track_started(self.tx.clone(), origin_id, id));
@@ -363,7 +372,9 @@ where
 }
 
 fn level_to_volume(level: u8) -> f32 {
-    f32::from(level) / f32::from(MAX_VOLUME)
+    let mul = VOLUME_LEVELS[level.wrapping_sub(1) as usize];
+    tracing::debug!(level = level, mul = mul, "volume");
+    mul
 }
 
 fn change_level(level: u8, modifier: i8) -> u8 {
