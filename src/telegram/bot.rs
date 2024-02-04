@@ -30,7 +30,7 @@ pub fn spawn(
 
     let shutdown = dispatcher.shutdown_token();
     tokio::spawn(async move {
-        tracing::info!("dispatcing telegram bot requests");
+        tracing::info!("dispatching telegram bot requests");
         dispatcher.dispatch().await;
     });
     tokio::spawn(async move {
