@@ -1,3 +1,5 @@
+use anyhow::Result as AnyResult;
+use futures::Future;
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::dispatching::Dispatcher;
 use teloxide::prelude::*;
@@ -7,14 +9,13 @@ use tokio_util::sync::CancellationToken;
 use super::dispatch::schema;
 use super::state::{DialogueData, Settings, State};
 use crate::controller::Controller;
-use crate::util::cancel::Task;
 
 pub fn spawn(
     token: CancellationToken,
     bot_token: &str,
     controller: &Controller,
     settings: Settings,
-) -> Task {
+) -> impl Future<Output = AnyResult<()>> {
     let (tx, rx) = controller.subscribe();
     let bot = Bot::new(bot_token);
     let (state, task) = State::new(settings, token.clone(), bot.clone(), rx);

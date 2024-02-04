@@ -7,7 +7,7 @@ use std::task::Poll;
 use anyhow::Result as AnyResult;
 use atomic_counter::{AtomicCounter, ConsistentCounter, RelaxedCounter};
 use futures::stream::once;
-use futures::{ready, stream_select, FutureExt, Stream, StreamExt};
+use futures::{ready, stream_select, Future, FutureExt, Stream, StreamExt};
 use itertools::Itertools;
 use pin_project::pin_project;
 use thiserror::Error;
@@ -21,7 +21,6 @@ use crate::player::{
     QueueId, Receiver as PlayerReceiver, Request as PlayerRequest, Result as PlayerResult,
 };
 use crate::track_manager::{Event as ManagerEvent, Receiver as ManagerReceiver, TrackManager};
-use crate::util::cancel::Task;
 use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track, TrackId, Youtube};
 
@@ -172,7 +171,7 @@ impl Controller {
         token: CancellationToken,
         youtube: Youtube,
         settings: Settings,
-    ) -> AnyResult<(Self, Task)> {
+    ) -> AnyResult<(Self, impl Future<Output = AnyResult<()>>)> {
         let (tx, _) = broadcast::channel(BROADCAST_QUEUE_SIZE);
         let (manager, manager_receiver) =
             TrackManager::new(youtube.clone(), settings.track_cache_size);
@@ -183,13 +182,13 @@ impl Controller {
             tx: tx.clone(),
             state: state.clone(),
         };
-        let task = tokio::spawn(State::serve_forever(
+        let task = State::serve_forever(
             state,
             token,
             Broadcast(tx),
             player_receiver,
             manager_receiver,
-        ));
+        );
 
         Ok((controller, task))
     }

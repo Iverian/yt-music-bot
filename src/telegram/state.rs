@@ -23,7 +23,6 @@ use super::defs::{REQUEST_STORAGE_CAPACITY, TRACKS_IN_MESSAGE};
 use super::display::TrackFmt;
 use crate::controller::{Event, EventWrapper, Receiver as ControllerReceiver};
 use crate::player::OriginId;
-use crate::util::cancel::Task;
 
 pub type DialogueStorage = InMemStorage<DialogueData>;
 pub type Dialogue = teloxide::dispatching::dialogue::Dialogue<DialogueData, DialogueStorage>;
@@ -91,11 +90,11 @@ impl State {
         token: CancellationToken,
         bot: Bot,
         rx: ControllerReceiver,
-    ) -> (Self, Task) {
+    ) -> (Self, impl Future<Output = AnyResult<()>>) {
         let (rtx, rrx) = mpsc::unbounded_channel();
 
         let chats = Arc::new(DashSet::new());
-        let task = tokio::spawn(Handler::new(bot, chats.clone()).serve_forever(token, rrx, rx));
+        let task = Handler::new(bot, chats.clone()).serve_forever(token, rrx, rx);
         let result = Self {
             tx: rtx,
             chats,

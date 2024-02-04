@@ -6,7 +6,7 @@ use anyhow::Result as AnyResult;
 use async_stream::try_stream;
 use camino::Utf8PathBuf;
 use futures::stream::once;
-use futures::{stream_select, FutureExt, Stream};
+use futures::{stream_select, Future, FutureExt, Stream};
 use itertools::Itertools;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -21,7 +21,6 @@ use crate::controller::{
     Sender as ControllerSender,
 };
 use crate::player::{Error as PlayerError, MAX_VOLUME};
-use crate::util::cancel::Task;
 use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track};
 
@@ -31,11 +30,11 @@ pub fn spawn(
     token: CancellationToken,
     path: Utf8PathBuf,
     controller: Controller,
-) -> AnyResult<Task> {
+) -> AnyResult<impl Future<Output = AnyResult<()>>> {
     let listener = UnixListener::bind(&path)?;
     tracing::info!(address = ?path, "admin server started");
     let server = Server { token, controller };
-    let task = tokio::spawn(server.serve_forever(path, listener));
+    let task = server.serve_forever(path, listener);
     Ok(task)
 }
 
