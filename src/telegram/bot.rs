@@ -5,11 +5,13 @@ use teloxide::dispatching::Dispatcher;
 use teloxide::prelude::*;
 use teloxide::Bot;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 use super::dispatch::schema;
 use super::state::{DialogueData, Settings, State};
 use crate::controller::Controller;
 
+#[instrument(skip(token, bot_token, controller))]
 pub fn spawn(
     token: CancellationToken,
     bot_token: &str,

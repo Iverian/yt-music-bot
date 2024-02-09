@@ -1,6 +1,6 @@
 #![allow(clippy::unused_async)]
 
-use std::fmt::Write;
+use std::fmt::{Debug, Write};
 use std::time::Duration;
 
 use anyhow::{Error as AnyError, Result as AnyResult};
@@ -10,6 +10,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatAction, Message, ParseMode};
 use teloxide::utils::command::BotCommands as _;
 use teloxide::{filter_command, Bot};
+use tracing::instrument;
 use url::Url;
 
 use super::defs::{CONFIRM_TEXT, TRACKS_IN_MESSAGE};
@@ -64,6 +65,7 @@ enum Command {
     Show,
 }
 
+#[instrument]
 pub fn schema() -> UpdateHandler<AnyError> {
     use dptree::case;
 
@@ -98,6 +100,7 @@ pub fn schema() -> UpdateHandler<AnyError> {
     dialogue::enter::<Update, DialogueStorage, DialogueData, _>().branch(message_handler)
 }
 
+#[instrument(skip(bot, state, dialogue))]
 async fn start(bot: Bot, msg: Message, state: State, dialogue: Dialogue) -> HandlerResult {
     state.subscribe(msg.chat.id);
     dialogue.update(DialogueData::Run).await?;
@@ -105,6 +108,7 @@ async fn start(bot: Bot, msg: Message, state: State, dialogue: Dialogue) -> Hand
     Ok(())
 }
 
+#[instrument(skip(bot, state, dialogue))]
 async fn stop(bot: Bot, msg: Message, state: State, dialogue: Dialogue) -> HandlerResult {
     state.unsubscribe(msg.chat.id);
     dialogue.update(DialogueData::Start).await?;
@@ -112,6 +116,7 @@ async fn stop(bot: Bot, msg: Message, state: State, dialogue: Dialogue) -> Handl
     Ok(())
 }
 
+#[instrument(skip(bot))]
 async fn help(bot: Bot, msg: Message) -> HandlerResult {
     bot.send_message(msg.chat.id, Command::descriptions().to_string())
         .reply_to_message_id(msg.id)
@@ -119,54 +124,63 @@ async fn help(bot: Bot, msg: Message) -> HandlerResult {
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn play(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.play()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn pause(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.pause()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn play_toggle(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.play_toggle()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn clear(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.stop()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn skip(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.skip()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn mute(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.mute()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn unmute(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.unmute()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn mute_toggle(bot: Bot, msg: Message, state: State, tx: ControllerSender) -> HandlerResult {
     state.request(&msg, tx.mute_toggle()).await?;
     confirm_request(&bot, &msg).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn volume(
     bot: Bot,
     msg: Message,
@@ -183,6 +197,7 @@ async fn volume(
     Ok(())
 }
 
+#[instrument(skip(bot, state, tx))]
 async fn queue(
     bot: Bot,
     msg: Message,
@@ -203,6 +218,7 @@ async fn queue(
     Ok(())
 }
 
+#[instrument(skip(tx, state, bot))]
 async fn queue_impl(
     tx: ControllerSender,
     urls: Vec<Url>,
@@ -243,12 +259,14 @@ async fn queue_impl(
     Ok(())
 }
 
+#[instrument(skip(bot, tx))]
 async fn status(bot: Bot, msg: Message, tx: ControllerSender) -> HandlerResult {
     let status = tx.status().await?;
     reply_md(&bot, &msg, StatusFmt(&status).to_string()).await?;
     Ok(())
 }
 
+#[instrument(skip(bot, tx))]
 async fn show(bot: Bot, msg: Message, tx: ControllerSender) -> HandlerResult {
     bot.send_chat_action(msg.chat.id, ChatAction::Typing)
         .await?;
@@ -301,6 +319,7 @@ async fn show(bot: Bot, msg: Message, tx: ControllerSender) -> HandlerResult {
     Ok(())
 }
 
+#[instrument(skip(bot))]
 async fn error(bot: Bot, msg: Message) -> HandlerResult {
     if msg.text().is_some_and(|x| x.starts_with('/')) {
         reply(
@@ -314,13 +333,15 @@ async fn error(bot: Bot, msg: Message) -> HandlerResult {
     Ok(())
 }
 
+#[instrument(skip(bot))]
 async fn confirm_request(bot: &Bot, msg: &Message) -> HandlerResult {
     reply(bot, msg, CONFIRM_TEXT).await
 }
 
+#[instrument(skip(bot))]
 async fn reply<S>(bot: &Bot, msg: &Message, text: S) -> HandlerResult
 where
-    S: Into<String>,
+    S: Into<String> + Debug,
 {
     bot.send_message(msg.chat.id, text)
         .reply_to_message_id(msg.id)
@@ -328,9 +349,10 @@ where
     Ok(())
 }
 
+#[instrument(skip(bot))]
 async fn reply_md<S>(bot: &Bot, msg: &Message, text: S) -> HandlerResult
 where
-    S: Into<String>,
+    S: Into<String> + Debug,
 {
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::MarkdownV2)
@@ -339,6 +361,7 @@ where
     Ok(())
 }
 
+#[instrument]
 fn filter_tracks(tracks: Vec<Track>, settings: &Settings) -> Vec<Track> {
     let mut cur = Duration::ZERO;
     tracks

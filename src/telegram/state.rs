@@ -18,6 +18,7 @@ use teloxide::Bot;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 use super::defs::{REQUEST_STORAGE_CAPACITY, TRACKS_IN_MESSAGE};
 use super::display::TrackFmt;
@@ -85,6 +86,7 @@ struct ReplyTo {
 }
 
 impl State {
+    #[instrument(skip(token, bot, rx))]
     pub fn new(
         settings: Settings,
         token: CancellationToken,
@@ -104,6 +106,7 @@ impl State {
         (result, task)
     }
 
+    #[instrument(skip(self, f))]
     pub async fn request<F>(&self, msg: &Message, f: F) -> AnyResult<()>
     where
         F: Future<Output = crate::controller::Result<OriginId>>,
@@ -121,20 +124,24 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub fn subscribe(&self, chat_id: ChatId) {
         self.chats.insert(chat_id);
     }
 
+    #[instrument(skip(self))]
     pub fn unsubscribe(&self, chat_id: ChatId) {
         self.chats.remove(&chat_id);
     }
 
+    #[instrument(skip_all)]
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
 }
 
 impl Handler {
+    #[instrument(skip_all)]
     fn new(bot: Bot, chats: ChatSet) -> Self {
         Self {
             bot,
@@ -143,6 +150,7 @@ impl Handler {
         }
     }
 
+    #[instrument(skip_all)]
     async fn serve_forever(
         mut self,
         token: CancellationToken,
@@ -175,6 +183,7 @@ impl Handler {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn handle(&mut self, origin_id: OriginId, e: Event) -> AnyResult<()> {
         tracing::debug!(event = ?e, origin_id = origin_id, "bot notification");
 
@@ -210,6 +219,7 @@ impl Handler {
     }
 }
 
+#[instrument]
 fn format_event(
     e: Event,
     request: Option<&RequestData>,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::instrument;
 
 use crate::player::OriginId;
 use crate::util::channel::ChannelResult;
@@ -31,9 +32,10 @@ type RequestTx = mpsc::UnboundedSender<Request>;
 type RequestRx = mpsc::UnboundedReceiver<Request>;
 type EventTx = mpsc::UnboundedSender<Event>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Worker(Arc<State>);
 
+#[derive(Debug)]
 struct State {
     tx: EventTx,
     youtube: Youtube,
@@ -41,7 +43,7 @@ struct State {
     data: Mutex<Data>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Data {
     tracks: HashMap<TrackId, TrackData>,
     queue: VecDeque<(OriginId, TrackId)>,
@@ -62,6 +64,7 @@ enum Request {
 }
 
 impl TrackManager {
+    #[instrument(skip(youtube))]
     pub fn new(youtube: Youtube, cache_size: usize) -> (TrackManager, Receiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (etx, erx) = mpsc::unbounded_channel();
@@ -70,16 +73,19 @@ impl TrackManager {
         (Self { tx }, Receiver::new(erx))
     }
 
+    #[instrument(skip(self))]
     pub fn claim(&self, origin_id: OriginId, id: TrackId) -> ChannelResult<()> {
         self.tx.send(Request::Claim { origin_id, id })?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub fn unclaim(&self, id: TrackId) -> ChannelResult<()> {
         self.tx.send(Request::Unclaim { id })?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub fn clear(&self) -> ChannelResult<()> {
         self.tx.send(Request::Clear)?;
         Ok(())
@@ -87,6 +93,7 @@ impl TrackManager {
 }
 
 impl Worker {
+    #[instrument(skip(tx, youtube))]
     fn new(tx: EventTx, youtube: Youtube, cache_size: usize) -> Self {
         Self(Arc::new(State {
             tx,
@@ -95,6 +102,8 @@ impl Worker {
             data: Mutex::new(Data::default()),
         }))
     }
+
+    #[instrument(skip_all)]
     async fn serve_forever(self, mut rx: RequestRx) -> ChannelResult<()> {
         while let Some(req) = rx.recv().await {
             self.request_handler(req).await?;
@@ -102,6 +111,7 @@ impl Worker {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn request_handler(&self, req: Request) -> ChannelResult<()> {
         tracing::debug!(request = ?req, "track manager request");
         match req {
@@ -120,6 +130,7 @@ impl Worker {
 }
 
 impl State {
+    #[instrument(skip(self))]
     async fn claim(self: &Arc<Self>, origin_id: OriginId, id: TrackId) -> ChannelResult<()> {
         let mut data = self.data.lock().await;
         if let Some(track) = data.tracks.get_mut(&id) {
@@ -138,6 +149,7 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn unclaim(
         self: &Arc<Self>,
         id: TrackId,
@@ -157,14 +169,17 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn clear(self: &Arc<Self>) {
         self.data.lock().await.clear();
     }
 
+    #[instrument(skip(self))]
     fn download(self: &Arc<Self>, origin_id: OriginId, id: TrackId) {
         tokio::spawn(self.clone().download_impl(origin_id, id));
     }
 
+    #[instrument(skip(self))]
     async fn download_impl(self: Arc<Self>, origin_id: OriginId, id: TrackId) {
         let path = match self.youtube.download_by_id(&id).await {
             Ok(x) => x,
@@ -179,6 +194,7 @@ impl State {
         self.tx.send(Event::Acquired { id }).ok();
     }
 
+    #[instrument(skip(self))]
     async fn download_error(
         self: &Arc<Self>,
         origin_id: OriginId,
@@ -194,6 +210,7 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn try_download(self: &Arc<Self>, data: &mut Data, origin_id: usize, id: String) {
         if data.size == self.cache_size {
             data.queue.push_back((origin_id, id));
@@ -203,6 +220,7 @@ impl State {
         }
     }
 
+    #[instrument(skip(self))]
     fn rotate_track(self: &Arc<Self>, data: &mut Data, id: &String) {
         data.tracks.remove(id);
         if let Some((origin_id, id)) = data.queue.pop_front() {
@@ -214,6 +232,7 @@ impl State {
 }
 
 impl Data {
+    #[instrument(skip_all)]
     fn clear(&mut self) {
         self.queue.clear();
         self.tracks.clear();
@@ -222,18 +241,22 @@ impl Data {
 }
 
 impl TrackData {
+    #[instrument(skip_all)]
     fn needs_download(&self) -> bool {
         self.claims <= 1 && self.path.is_none()
     }
 
+    #[instrument(skip_all)]
     fn present(&self) -> bool {
         self.path.is_some()
     }
 
+    #[instrument(skip_all)]
     fn can_remove(&self) -> bool {
         self.claims == 0 && self.path.is_some()
     }
 
+    #[instrument(skip(self))]
     async fn try_set_path(&mut self, path: Utf8PathBuf) -> bool {
         let has_claims = self.claims != 0;
         if has_claims {
@@ -245,6 +268,7 @@ impl TrackData {
         has_claims
     }
 
+    #[instrument(skip_all)]
     async fn remove(&mut self) {
         if let Some(path) = &self.path {
             tracing::debug!(path = ?path, "remove track");
@@ -252,10 +276,12 @@ impl TrackData {
         }
     }
 
+    #[instrument(skip_all)]
     fn claim(&mut self) {
         self.claims += 1;
     }
 
+    #[instrument(skip_all)]
     fn unclaim(&mut self) {
         if self.claims == 0 {
             return;

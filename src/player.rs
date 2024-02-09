@@ -10,6 +10,7 @@ use rodio::{Decoder, OutputStream, Sink};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::instrument;
 
 use crate::util::channel::ChannelError;
 
@@ -98,6 +99,7 @@ type StartupTx = oneshot::Sender<AnyResult<()>>;
 type OpenTrack = Decoder<BufReader<File>>;
 type Callback = EmptyCallback<f32>;
 
+#[derive(Debug)]
 struct RequestEnvelope {
     tx: ResponseTx,
     origin_id: OriginId,
@@ -112,6 +114,7 @@ struct Worker {
 }
 
 impl Player {
+    #[instrument]
     pub async fn new() -> AnyResult<(Self, Receiver)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (etx, erx) = mpsc::unbounded_channel();
@@ -121,6 +124,7 @@ impl Player {
         Ok((Self { tx }, Receiver::new(erx)))
     }
 
+    #[instrument(skip(self))]
     pub async fn request(&self, origin_id: OriginId, payload: Request) -> Result<Response> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -136,6 +140,7 @@ impl Player {
 }
 
 impl Worker {
+    #[instrument(skip_all)]
     fn run(stx: StartupTx, tx: EventTx, rx: RequestRx) {
         let (_stream, sink) = match Self::init() {
             Ok(x) => x,
@@ -155,6 +160,7 @@ impl Worker {
         tracing::info!("player finished");
     }
 
+    #[instrument]
     fn init() -> AnyResult<(OutputStream, Sink)> {
         let (stream, stream_handle) = OutputStream::try_default()?;
         let sink = Sink::try_new(&stream_handle)?;
@@ -162,6 +168,7 @@ impl Worker {
         Ok((stream, sink))
     }
 
+    #[instrument(skip(self))]
     fn serve_forever(mut self, mut rx: RequestRx) {
         loop {
             let Some(RequestEnvelope {
@@ -177,6 +184,7 @@ impl Worker {
         }
     }
 
+    #[instrument(skip(self))]
     fn request_handler(&mut self, origin_id: OriginId, payload: Request) -> Result<Response> {
         match payload {
             Request::Play => {
@@ -222,6 +230,7 @@ impl Worker {
         Ok(None)
     }
 
+    #[instrument(skip_all)]
     fn status_handler(&mut self) -> Status {
         let sink_length = self.sink.len();
 
@@ -233,6 +242,7 @@ impl Worker {
         }
     }
 
+    #[instrument(skip(self))]
     fn queue_handler(&mut self, origin_id: OriginId, path: Utf8PathBuf, id: usize) -> Result<()> {
         let track = open_track(path).map_err(|_| Error::InvalidTrack)?;
 
@@ -245,6 +255,7 @@ impl Worker {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn change_volume_handler(&mut self, origin_id: OriginId, modifier: i8) {
         self.volume_level = change_level(self.volume_level, modifier);
         self.send(origin_id, EventKind::Volume(self.volume_level));
@@ -253,6 +264,7 @@ impl Worker {
         }
     }
 
+    #[instrument(skip(self))]
     fn set_volume_handler(&mut self, origin_id: OriginId, level: u8) -> Result<()> {
         if !(MIN_VOLUME..=MAX_VOLUME).contains(&level) {
             return Err(Error::InvalidVolumeLevel);
@@ -265,6 +277,7 @@ impl Worker {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn mute_toggle_handler(&mut self, origin_id: OriginId) {
         if self.is_muted {
             self.send(origin_id, EventKind::Unmuted);
@@ -277,6 +290,7 @@ impl Worker {
         }
     }
 
+    #[instrument(skip(self))]
     fn unmute_handler(&mut self, origin_id: OriginId) {
         if !self.is_muted {
             return;
@@ -286,6 +300,7 @@ impl Worker {
         self.sink.set_volume(level_to_volume(self.volume_level));
     }
 
+    #[instrument(skip(self))]
     fn mute_handler(&mut self, origin_id: OriginId) {
         if self.is_muted {
             return;
@@ -295,6 +310,7 @@ impl Worker {
         self.sink.set_volume(0.);
     }
 
+    #[instrument(skip_all)]
     fn skip_handler(&mut self) -> Result<()> {
         if self.sink.empty() {
             return Err(Error::QueueEmpty);
@@ -303,6 +319,7 @@ impl Worker {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn stop_handler(&mut self, origin_id: OriginId) {
         if !self.sink.empty() {
             self.send(origin_id, EventKind::PlaybackStopped);
@@ -311,6 +328,7 @@ impl Worker {
         self.sink.pause();
     }
 
+    #[instrument(skip(self))]
     fn play_toggle_handler(&mut self, origin_id: OriginId) {
         if self.sink.is_paused() {
             self.send(origin_id, EventKind::PlaybackStarted);
@@ -321,6 +339,7 @@ impl Worker {
         }
     }
 
+    #[instrument(skip(self))]
     fn pause_handler(&mut self, origin_id: OriginId) {
         if !self.sink.is_paused() {
             self.send(origin_id, EventKind::PlaybackPaused);
@@ -328,6 +347,7 @@ impl Worker {
         self.sink.pause();
     }
 
+    #[instrument(skip(self))]
     fn play_handler(&mut self, origin_id: OriginId) {
         if self.sink.is_paused() {
             self.send(origin_id, EventKind::PlaybackStarted);
@@ -335,15 +355,18 @@ impl Worker {
         self.sink.play();
     }
 
+    #[instrument(skip(self))]
     fn send(&self, origin_id: OriginId, e: EventKind) {
         self.tx.send(Event { origin_id, kind: e }).unwrap();
     }
 }
 
+#[instrument]
 fn open_track(path: Utf8PathBuf) -> AnyResult<OpenTrack> {
     Ok(Decoder::new(BufReader::new(File::open(path)?))?)
 }
 
+#[instrument(skip(tx))]
 fn cb_track_started(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
     cb_source(move || {
         tx.send(Event {
@@ -354,6 +377,7 @@ fn cb_track_started(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
     })
 }
 
+#[instrument(skip(tx))]
 fn cb_track_finished(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
     cb_source(move || {
         tx.send(Event {

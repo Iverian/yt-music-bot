@@ -2,8 +2,19 @@ use std::time::Duration;
 
 use camino::Utf8PathBuf;
 use clap::Parser;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::runtime::{self};
+use opentelemetry_sdk::trace::{BatchConfig, Tracer};
+use opentelemetry_sdk::Resource;
+use opentelemetry_semantic_conventions::resource::{
+    DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION,
+};
+use opentelemetry_semantic_conventions::SCHEMA_URL;
+use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
+use url::Url;
 
 use crate::controller::Settings as ControllerSettings;
 use crate::telegram::Settings as BotSettings;
@@ -50,12 +61,9 @@ pub struct Cli {
     /// Logging level
     #[arg(long, env = "APP_LOG_LEVEL", default_value = "INFO")]
     log_level: LevelFilter,
-    /// Format logs as json
-    #[arg(long, env = "APP_LOG_USE_JSON")]
-    log_use_json: bool,
-    /// Enable tokio console
-    #[arg(long, env = "APP_LOG_USE_CONSOLE")]
-    log_use_console: bool,
+    /// Enable opentelemetry
+    #[arg(long, env = "APP_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<Url>,
 }
 
 impl Cli {
@@ -85,25 +93,16 @@ impl Cli {
     }
 
     pub fn configure(&self) {
-        let log = if self.log_use_json {
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(std::io::stderr)
-                .with_filter(self.log_level)
-                .boxed()
-        } else {
-            tracing_subscriber::fmt::layer()
-                .compact()
-                .without_time()
-                .with_writer(std::io::stderr)
-                .with_filter(self.log_level)
-                .boxed()
-        };
+        let log = tracing_subscriber::fmt::layer()
+            .compact()
+            .without_time()
+            .with_writer(std::io::stderr)
+            .with_filter(self.log_level);
 
-        if self.log_use_console {
+        if let Some(url) = self.otlp_endpoint.as_ref() {
             tracing_subscriber::registry()
                 .with(log)
-                .with(console_subscriber::spawn())
+                .with(OpenTelemetryLayer::new(init_tracer(url.clone())).with_filter(self.log_level))
                 .init();
         } else {
             tracing_subscriber::registry().with(log).init();
@@ -113,4 +112,29 @@ impl Cli {
     fn default_workers() -> usize {
         num_cpus::get()
     }
+}
+
+fn init_tracer(url: Url) -> Tracer {
+    opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(resource()))
+        .with_batch_config(BatchConfig::default())
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(url),
+        )
+        .install_batch(runtime::TokioCurrentThread)
+        .unwrap()
+}
+
+fn resource() -> Resource {
+    Resource::from_schema_url(
+        [
+            KeyValue::new(SERVICE_NAME, env!("CARGO_PKG_NAME")),
+            KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+            KeyValue::new(DEPLOYMENT_ENVIRONMENT, "develop"),
+        ],
+        SCHEMA_URL,
+    )
 }

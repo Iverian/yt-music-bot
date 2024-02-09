@@ -13,6 +13,7 @@ use regex::Regex;
 use rust_embed::RustEmbed;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tracing::instrument;
 use url::Url;
 
 use crate::util::channel::ChannelError;
@@ -87,7 +88,7 @@ type StartupTx = oneshot::Sender<AnyResult<()>>;
 #[include = "*.py"]
 struct PythonFiles;
 
-#[derive(FromPyObject)]
+#[derive(Debug, FromPyObject)]
 struct TrackRaw {
     track_id: String,
     title: String,
@@ -98,23 +99,26 @@ struct TrackRaw {
     path: String,
 }
 
-#[derive(FromPyObject)]
+#[derive(Debug, FromPyObject)]
 struct ErrorRaw {
     kind: i64,
     url: String,
     message: Option<String>,
 }
 
+#[derive(Debug)]
 struct RequestEnvelope {
     tx: ResponseTx,
     payload: Request,
 }
 
+#[derive(Debug)]
 enum Request {
     Resolve(Vec<Url>),
     Download(Url),
 }
 
+#[derive(Debug)]
 enum Response {
     Resolve(Vec<Track>),
     Download(Utf8PathBuf),
@@ -126,6 +130,7 @@ struct Worker<'a> {
 }
 
 impl Youtube {
+    #[instrument]
     pub async fn new(download_dir: Utf8PathBuf, settings: Settings) -> AnyResult<Self> {
         let (tx, rx) = mpsc::channel(settings.jobs);
         let (stx, srx) = oneshot::channel();
@@ -134,6 +139,7 @@ impl Youtube {
         Ok(Self { tx })
     }
 
+    #[instrument(skip(self))]
     pub async fn resolve(&self, urls: Vec<Url>) -> Result<Vec<Track>> {
         for url in &urls {
             let host = url
@@ -150,6 +156,7 @@ impl Youtube {
         })
     }
 
+    #[instrument(skip(self))]
     pub async fn download_by_id(&self, id: &str) -> Result<Utf8PathBuf> {
         self.request(Request::Download(make_youtube_url(id)))
             .await
@@ -159,6 +166,7 @@ impl Youtube {
             })
     }
 
+    #[instrument(skip(self))]
     async fn request(&self, payload: Request) -> Result<Response> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -170,6 +178,7 @@ impl Youtube {
 }
 
 impl<'a> Worker<'a> {
+    #[instrument(skip(self))]
     fn serve_forever(self, mut rx: RequestRx) {
         loop {
             let Some(RequestEnvelope { tx, payload }) = rx.blocking_recv() else {
@@ -179,6 +188,7 @@ impl<'a> Worker<'a> {
         }
     }
 
+    #[instrument(skip(self))]
     fn request_handler(&self, payload: Request) -> Result<Response> {
         Ok(match payload {
             Request::Resolve(urls) => {
@@ -224,6 +234,7 @@ impl<'a> Worker<'a> {
 }
 
 impl Worker<'_> {
+    #[instrument(skip(stx, rx))]
     fn run(stx: StartupTx, rx: RequestRx, download_dir: &Utf8Path, settings: Settings) {
         Python::with_gil(|py| {
             let server = match Self::load_python_code(py, download_dir, settings) {
@@ -240,6 +251,7 @@ impl Worker<'_> {
         });
     }
 
+    #[instrument(skip(py))]
     fn load_python_code<'b>(
         py: Python<'b>,
         download_dir: &Utf8Path,
@@ -287,6 +299,7 @@ impl From<TrackRaw> for Track {
     }
 }
 
+#[instrument]
 fn make_youtube_url(id: &str) -> Url {
     let mut result = BASE_URL.clone();
     {

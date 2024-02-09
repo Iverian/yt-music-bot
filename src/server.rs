@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::io;
 use std::pin::pin;
 
@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 use crate::controller::{
     Controller, Error as ControllerError, Event, QueuedTrackState, Receiver as ControllerReceiver,
@@ -156,7 +157,7 @@ impl Connection {
         tokio::spawn(result.serve_requests(reader));
     }
 
-    #[tracing::instrument(skip_all)]
+    #[instrument(skip_all)]
     async fn serve_requests(mut self, rdr: Reader) {
         if let Err(e) = self.serve_forever_impl(rdr).await {
             tracing::debug!(error = ?e, "unhandled error in connection");
@@ -191,7 +192,7 @@ impl Connection {
 
         Ok(())
     }
-    #[tracing::instrument(skip(self))]
+    #[instrument(skip(self))]
     async fn handle_wrapper(&mut self, request: &str) -> bool {
         self.handle_request(request)
             .await
@@ -199,7 +200,7 @@ impl Connection {
             .unwrap_or(true)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[instrument(skip(self))]
     fn handle_error(&mut self, e: Error) -> Result<bool> {
         match e {
             Error::Channel(_) => {
@@ -292,7 +293,7 @@ impl Connection {
         Ok(false)
     }
 
-    #[tracing::instrument]
+    #[instrument]
     fn get_command(command: &str) -> Result<Command> {
         Ok(match command {
             "exit" => Command::Exit,
@@ -336,7 +337,7 @@ impl Connection {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[instrument(skip(self))]
     async fn queue_request(&mut self, args: &[String]) -> Result<()> {
         if args.is_empty() {
             self.list_queue_request().await
@@ -345,7 +346,7 @@ impl Connection {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[instrument(skip(self))]
     async fn queue_tracks_request(&mut self, args: &[String]) -> Result<()> {
         let urls = args
             .iter()
@@ -356,7 +357,7 @@ impl Connection {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all)]
+    #[instrument(skip(self))]
     async fn list_queue_request(&mut self) -> Result<()> {
         let view = self.tx.view().await;
         if view.queue.is_empty() {
@@ -384,6 +385,7 @@ impl Connection {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn serve_notifications(mut rx: ControllerReceiver, wrt: Writer) {
         while let Some(e) = rx.next().await {
             if Self::handle_notification(e, &wrt).is_err() {
@@ -392,7 +394,7 @@ impl Connection {
         }
     }
 
-    #[tracing::instrument(skip(writer))]
+    #[instrument(skip(writer))]
     fn handle_notification(e: Event, writer: &Writer) -> ChannelResult<()> {
         match e {
             Event::Muted => writer.write("[*] Muted"),
@@ -419,6 +421,7 @@ impl Connection {
 }
 
 impl Writer {
+    #[instrument(skip_all)]
     fn new(writer: OwnedWriteHalf) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let result = Self(tx);
@@ -430,27 +433,32 @@ impl Writer {
         result
     }
 
+    #[instrument(skip_all)]
     fn close(&self) {
         self.0.send(WriteMessage::Exit).ok();
     }
 
+    #[instrument(skip_all)]
     fn set_prompt(&self) -> ChannelResult<()> {
         self.0.send(WriteMessage::SetPrompt)?;
         Ok(())
     }
 
+    #[instrument(skip_all)]
     fn clear_prompt(&self) -> ChannelResult<()> {
         self.0.send(WriteMessage::ClearPrompt)?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn write<S>(&self, line: S) -> ChannelResult<()>
     where
-        S: Into<String>,
+        S: Into<String> + Debug,
     {
         self.write_many(vec![line.into()])
     }
 
+    #[instrument(skip(self))]
     fn write_many(&self, lines: Vec<String>) -> ChannelResult<()> {
         self.0.send(WriteMessage::Lines(lines))?;
         Ok(())
@@ -458,6 +466,7 @@ impl Writer {
 }
 
 impl WriterWorker {
+    #[instrument(skip_all)]
     async fn serve_forever(mut self, mut rx: WriterRx) {
         while let Some(x) = rx.recv().await {
             let stop = match x {
@@ -476,6 +485,7 @@ impl WriterWorker {
         }
     }
 
+    #[instrument(skip_all)]
     async fn handle_prompt(&mut self) -> io::Result<()> {
         self.writer.write_all(b"> ").await?;
         self.writer.flush().await?;
@@ -483,6 +493,7 @@ impl WriterWorker {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn handle_message(&mut self, lines: Vec<String>) -> io::Result<()> {
         if self.prompt {
             self.writer.write_u8(b'\n').await?;
@@ -496,6 +507,7 @@ impl WriterWorker {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn close(self, mut rx: WriterRx) {
         self.writer.into_inner().shutdown().await.ok();
         rx.close();
@@ -523,6 +535,7 @@ impl From<ControllerError> for Error {
     }
 }
 
+#[instrument(skip_all)]
 fn accept_stream(listener: UnixListener) -> impl Stream<Item = io::Result<UnixStream>> {
     try_stream! {
         loop {

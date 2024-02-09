@@ -14,6 +14,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 use url::Url;
 
 use crate::player::{
@@ -167,6 +168,7 @@ enum MergedEvent {
 }
 
 impl Controller {
+    #[instrument(skip(token, youtube))]
     pub async fn new(
         token: CancellationToken,
         youtube: Youtube,
@@ -193,6 +195,7 @@ impl Controller {
         Ok((controller, task))
     }
 
+    #[instrument(skip_all)]
     pub fn subscribe(&self) -> (Sender, Receiver) {
         (
             Sender {
@@ -205,10 +208,12 @@ impl Controller {
 }
 
 impl Receiver {
+    #[instrument(skip_all)]
     fn new(rx: EventRx) -> Self {
         Self(BroadcastStream::new(rx))
     }
 
+    #[instrument(skip_all)]
     pub fn wrap(self) -> ReceiverWrapped {
         ReceiverWrapped(self.0)
     }
@@ -249,6 +254,7 @@ impl Stream for ReceiverWrapped {
 }
 
 impl Sender {
+    #[instrument(skip(self))]
     pub async fn resolve(&self, urls: Vec<Url>) -> Result<Vec<Track>> {
         self.state.youtube.resolve(urls).await.map_err(|e| match e {
             YoutubeError::Channel(e) => Error::Channel(e),
@@ -256,6 +262,7 @@ impl Sender {
         })
     }
 
+    #[instrument(skip(self))]
     pub async fn queue(&self, tracks: Vec<Track>) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         let tracks = self.state.queue(origin_id, tracks).await?;
@@ -263,6 +270,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn play(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -272,6 +280,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn pause(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -281,6 +290,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn play_toggle(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -290,6 +300,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn stop(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -299,6 +310,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn skip(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -308,6 +320,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn mute(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -317,6 +330,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn unmute(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -326,6 +340,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn mute_toggle(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -335,6 +350,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip(self))]
     pub async fn set_volume(&self, level: u8) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -344,6 +360,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn increase_volume(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -353,6 +370,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn decrease_volume(&self) -> Result<OriginId> {
         let origin_id = self.state.origin_id_counter.inc();
         self.state
@@ -362,6 +380,7 @@ impl Sender {
         Ok(origin_id)
     }
 
+    #[instrument(skip_all)]
     pub async fn status(&self) -> Result<Status> {
         let status = self
             .state
@@ -381,23 +400,27 @@ impl Sender {
         })
     }
 
+    #[instrument(skip_all)]
     pub async fn view(&self) -> RwLockReadGuard<'_, Data> {
         self.state.data.read().await
     }
 }
 
 impl Broadcast {
+    #[instrument(skip(self))]
     fn send(&self, origin_id: OriginId, event: Event) -> ChannelResult<()> {
         self.0.send(EventWrapper { origin_id, event })?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn proxy(&self, origin_id: OriginId) -> BroadcastProxy<'_> {
         BroadcastProxy(&self.0, origin_id)
     }
 }
 
 impl<'a> BroadcastProxy<'a> {
+    #[instrument(skip(self))]
     fn send(&self, event: Event) -> ChannelResult<()> {
         self.0.send(EventWrapper {
             origin_id: self.1,
@@ -408,6 +431,7 @@ impl<'a> BroadcastProxy<'a> {
 }
 
 impl State {
+    #[instrument(skip(player, manager, youtube))]
     fn new(player: Player, manager: TrackManager, youtube: Youtube, auto_play: bool) -> Arc<Self> {
         Arc::new(Self {
             player,
@@ -419,6 +443,7 @@ impl State {
         })
     }
 
+    #[instrument(skip(self))]
     async fn queue(&self, origin_id: OriginId, tracks: Vec<Track>) -> Result<Vec<QueuedTrack>> {
         let mut data = self.data.write().await;
         let was_empty = data.queue.is_empty();
@@ -429,6 +454,7 @@ impl State {
         Ok(result)
     }
 
+    #[instrument(skip_all)]
     async fn serve_forever_impl(
         &self,
         token: CancellationToken,
@@ -460,6 +486,7 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn handle_player_event(&self, tx: &Broadcast, e: PlayerEvent) -> AnyResult<()> {
         tracing::debug!(event = ?e, "player event");
         let tx = tx.proxy(e.origin_id);
@@ -506,6 +533,7 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn handle_track_manager_event(&self, tx: &Broadcast, e: ManagerEvent) -> AnyResult<()> {
         tracing::debug!(event = ?e, "track manager event");
         match e {
@@ -529,6 +557,7 @@ impl State {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn serve_forever(
         state: Arc<Self>,
         token: CancellationToken,
@@ -541,6 +570,7 @@ impl State {
 }
 
 impl Data {
+    #[instrument(skip_all)]
     pub fn iter(&self) -> DataIterator<'_> {
         DataIterator {
             parent: self,
@@ -548,6 +578,7 @@ impl Data {
         }
     }
 
+    #[instrument(skip(self))]
     fn remove_track(&mut self, id: &TrackId) -> Track {
         let to_remove = self
             .queue
@@ -561,23 +592,28 @@ impl Data {
         t.meta
     }
 
+    #[instrument(skip(self))]
     fn ready_track(&mut self, id: &TrackId) {
         self.tracks.get_mut(id).unwrap().set_downloaded(true);
     }
 
+    #[instrument(skip(self))]
     fn unready_track(&mut self, id: &TrackId) {
         self.tracks.get_mut(id).unwrap().set_downloaded(false);
     }
 
+    #[instrument(skip(self))]
     fn set_queued(&mut self, id: QueueId) {
         self.queue.get_mut(&id).unwrap().set_sent_to_player(true);
     }
 
+    #[instrument(skip(self))]
     fn get_queued_track(&self, id: QueueId) -> &TrackData {
         let url = &self.queue.get(&id).unwrap().track_id;
         self.tracks.get(url).unwrap()
     }
 
+    #[instrument(skip_all)]
     fn get_now_playing_track(&self) -> Option<&Track> {
         let Some((
             _,
@@ -597,6 +633,7 @@ impl Data {
         Some(&track.meta)
     }
 
+    #[instrument(skip(self, manager))]
     fn queue(
         &mut self,
         origin_id: OriginId,
@@ -631,12 +668,14 @@ impl Data {
         Ok(result)
     }
 
+    #[instrument(skip_all)]
     pub fn first_track_state(&self) -> Option<QueuedTrackState> {
         self.queue
             .first_key_value()
             .map(|(_, v)| self.get_track_state(v, None))
     }
 
+    #[instrument(skip(self))]
     fn get_track_state(
         &self,
         queue_data: &QueueData,
@@ -660,6 +699,7 @@ impl Data {
         }
     }
 
+    #[instrument(skip_all)]
     async fn queue_player(&mut self, player: &Player) -> PlayerResult<()> {
         let Some((
             queue_id,
@@ -691,6 +731,7 @@ impl Data {
         Ok(())
     }
 
+    #[instrument(skip(self, manager))]
     fn remove_queue_player(&mut self, manager: &TrackManager, id: QueueId) -> ChannelResult<()> {
         let Some(x) = self.queue.remove(&id) else {
             return Ok(());
@@ -699,6 +740,7 @@ impl Data {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     fn stop(&mut self, manager: &TrackManager) -> ChannelResult<()> {
         manager.clear()?;
         self.queue.clear();
@@ -707,6 +749,7 @@ impl Data {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     fn reset_queue_counter(&self) {
         self.queue_id_counter.reset();
         loop {
@@ -717,6 +760,7 @@ impl Data {
         }
     }
 
+    #[instrument(skip_all)]
     fn inc_queue_id(&self) -> QueueId {
         let new_id = self.queue_id_counter.inc();
         // TODO: replace with sane wraparound handling
@@ -750,6 +794,7 @@ impl<'a> IntoIterator for &'a Data {
 impl<'a> Iterator for DataIterator<'a> {
     type Item = DataItemView<'a>;
 
+    #[instrument(skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
         let (&queue_id, queue_data) = self.iter.next()?;
 

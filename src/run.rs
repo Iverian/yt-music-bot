@@ -2,6 +2,7 @@ use anyhow::Result as AnyResult;
 use camino::Utf8PathBuf;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 use crate::cli::Cli;
 use crate::controller::{Controller, Settings as ControllerSettings};
@@ -10,6 +11,7 @@ use crate::telegram::{spawn as spawn_bot, Settings as BotSettings};
 use crate::util::temp_dir::TempDir;
 use crate::youtube::{Settings as YoutubeSettings, Youtube};
 
+#[instrument(skip_all)]
 pub async fn run(cli: Cli) -> AnyResult<()> {
     let controller_settings = cli.controller_settings();
     let bot_settings = cli.bot_settings();
@@ -32,6 +34,7 @@ pub async fn run(cli: Cli) -> AnyResult<()> {
     r
 }
 
+#[instrument(skip_all)]
 async fn run_inner(
     unix_socket_path: Option<Utf8PathBuf>,
     telegram_bot_token: Option<String>,
@@ -72,6 +75,7 @@ async fn run_inner(
     wait_for_tasks(token, join_set).await
 }
 
+#[instrument(skip_all)]
 pub async fn wait_for_tasks(
     token: CancellationToken,
     mut join_set: JoinSet<AnyResult<()>>,
@@ -93,6 +97,7 @@ pub async fn wait_for_tasks(
     result
 }
 
+#[instrument(skip_all)]
 pub fn wait_for_ctrlc(token: CancellationToken) {
     tokio::spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
