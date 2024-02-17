@@ -18,11 +18,11 @@ use teloxide::Bot;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
+use tracing::{instrument, Instrument, Span};
 
 use super::defs::{REQUEST_STORAGE_CAPACITY, TRACKS_IN_MESSAGE};
 use super::display::TrackFmt;
-use crate::controller::{Event, EventWrapper, Receiver as ControllerReceiver};
+use crate::controller::{Event, EventEnvelope, Receiver as ControllerReceiver};
 use crate::player::OriginId;
 
 pub type DialogueStorage = InMemStorage<DialogueData>;
@@ -68,6 +68,7 @@ type RequestRx = mpsc::UnboundedReceiver<RequestEntry>;
 
 #[derive(Clone)]
 struct RequestEntry {
+    span: Span,
     origin_id: OriginId,
     data: RequestData,
 }
@@ -75,7 +76,7 @@ struct RequestEntry {
 #[allow(clippy::large_enum_variant)]
 enum MergedEvent {
     Request(RequestEntry),
-    Controller(EventWrapper),
+    Controller(EventEnvelope),
     Cancel,
 }
 
@@ -113,11 +114,11 @@ impl State {
     {
         let origin_id = f.await?;
         self.tx.send(RequestEntry {
+            span: Span::current(),
             origin_id,
             data: RequestData {
                 chat_id: msg.chat.id,
                 message_id: msg.id,
-                // username: msg.from().and_then(|x| x.username.clone()),
             },
         })?;
 
@@ -162,17 +163,27 @@ impl Handler {
         let cancel = pin!(token.cancelled_owned().fuse());
         let mut stream = stream_select!(
             UnboundedReceiverStream::new(request_receiver).map(MergedEvent::Request),
-            controller_receiver.wrap().map(MergedEvent::Controller),
+            controller_receiver.map(MergedEvent::Controller),
             once(cancel).map(|()| MergedEvent::Cancel),
         );
 
         while let Some(x) = stream.next().await {
             match x {
-                MergedEvent::Request(RequestEntry { origin_id, data }) => {
-                    self.requests.insert(origin_id, data);
+                MergedEvent::Request(RequestEntry {
+                    span,
+                    origin_id,
+                    data,
+                }) => {
+                    span.in_scope(|| self.requests.insert(origin_id, data));
                 }
-                MergedEvent::Controller(x) => {
-                    self.handle(x.origin_id, x.event).await?;
+                MergedEvent::Controller(EventEnvelope {
+                    span,
+                    origin_id,
+                    event,
+                }) => {
+                    // let s = tracing::info_span!("controller telegram notification");
+                    // s.follows_from(span);
+                    self.handle(origin_id, event).instrument(span).await?;
                 }
                 MergedEvent::Cancel => {
                     break;
@@ -185,7 +196,7 @@ impl Handler {
 
     #[instrument(skip(self))]
     async fn handle(&mut self, origin_id: OriginId, e: Event) -> AnyResult<()> {
-        tracing::debug!(event = ?e, origin_id = origin_id, "bot notification");
+        tracing::debug!("bot notification");
 
         let request = self.requests.remove(&origin_id);
         let (messages, reply_to) = format_event(e, request.as_ref())?;
@@ -265,7 +276,6 @@ fn format_event(
             if let Some(RequestData {
                 chat_id,
                 message_id,
-                // username: _,
             }) = request
             {
                 reply_to = Some(ReplyTo {

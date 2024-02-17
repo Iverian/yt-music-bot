@@ -5,7 +5,7 @@ use clap::Parser;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::runtime::{self};
-use opentelemetry_sdk::trace::{BatchConfig, Tracer};
+use opentelemetry_sdk::trace::{BatchConfig, RandomIdGenerator, Tracer};
 use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions::resource::{
     DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION,
@@ -100,10 +100,9 @@ impl Cli {
             .with_filter(self.log_level);
 
         if let Some(url) = self.otlp_endpoint.as_ref() {
-            tracing_subscriber::registry()
-                .with(log)
-                .with(OpenTelemetryLayer::new(init_tracer(url.clone())).with_filter(self.log_level))
-                .init();
+            let tracer =
+                OpenTelemetryLayer::new(init_tracer(url.clone())).with_filter(LevelFilter::INFO);
+            tracing_subscriber::registry().with(log).with(tracer).init();
         } else {
             tracing_subscriber::registry().with(log).init();
         }
@@ -117,14 +116,18 @@ impl Cli {
 fn init_tracer(url: Url) -> Tracer {
     opentelemetry_otlp::new_pipeline()
         .tracing()
-        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(resource()))
+        .with_trace_config(
+            opentelemetry_sdk::trace::Config::default()
+                .with_id_generator(RandomIdGenerator::default())
+                .with_resource(resource()),
+        )
         .with_batch_config(BatchConfig::default())
         .with_exporter(
             opentelemetry_otlp::new_exporter()
                 .tonic()
                 .with_endpoint(url),
         )
-        .install_batch(runtime::TokioCurrentThread)
+        .install_batch(runtime::Tokio)
         .unwrap()
 }
 

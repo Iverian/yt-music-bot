@@ -3,7 +3,7 @@ import signal
 from dataclasses import dataclass
 from multiprocessing import Pipe, Process, Queue
 from multiprocessing.connection import Connection
-from typing import Any, List, Mapping, Optional, Union
+from typing import Any, Iterable, List, Mapping, Optional, Union
 
 from yt_dlp import YoutubeDL
 
@@ -206,7 +206,7 @@ class _Worker:
         if "track" in data and "artist" in data:
             title = str(data["track"])
             # В некоторых треках Youtube отдает список артистов через запятую
-            artist = [i.strip() for i in str(data["artist"]).split(",")]
+            artist = unique(i.strip() for i in str(data["artist"]).split(","))
             is_music_track = True
         else:
             title = str(data["title"])
@@ -239,6 +239,14 @@ class Error(Exception):
     @staticmethod
     def other(url: str, cause: Exception) -> "Error":
         return Error(E_OTHER, url, str(cause))
+
+
+def unique(value: Iterable[str]) -> List[str]:
+    result = []
+    for i in value:
+        if i not in result:
+            result.append(i)
+    return result
 
 
 def timeout(seconds: int, error_message: str):

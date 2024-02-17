@@ -4,17 +4,22 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::instrument;
+use tracing::{instrument, Span};
 
 use crate::player::OriginId;
 use crate::util::channel::ChannelResult;
 use crate::youtube::{Error as YoutubeError, TrackId, Youtube};
 
-pub type Receiver = UnboundedReceiverStream<Event>;
+pub type Receiver = UnboundedReceiverStream<EventEnvelope>;
 
 #[derive(Debug)]
 pub struct TrackManager {
     tx: RequestTx,
+}
+
+pub struct EventEnvelope {
+    pub span: Span,
+    pub event: Event,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +35,7 @@ pub enum Event {
 
 type RequestTx = mpsc::UnboundedSender<Request>;
 type RequestRx = mpsc::UnboundedReceiver<Request>;
-type EventTx = mpsc::UnboundedSender<Event>;
+type EventTx = mpsc::UnboundedSender<EventEnvelope>;
 
 #[derive(Debug, Clone)]
 struct Worker(Arc<State>);
@@ -138,7 +143,10 @@ impl State {
             if track.needs_download() {
                 self.try_download(&mut data, origin_id, id);
             } else if track.present() {
-                self.tx.send(Event::Acquired { id })?;
+                self.tx.send(EventEnvelope {
+                    span: Span::current(),
+                    event: Event::Acquired { id },
+                })?;
             }
         } else {
             let mut track = TrackData::default();
@@ -165,7 +173,10 @@ impl State {
         }
         track.remove().await;
         self.rotate_track(&mut data, &id);
-        self.tx.send(Event::Removed { id, e })?;
+        self.tx.send(EventEnvelope {
+            span: Span::current(),
+            event: Event::Removed { id, e },
+        })?;
         Ok(())
     }
 
@@ -191,7 +202,12 @@ impl State {
         let mut data = self.data.lock().await;
         let track = data.tracks.get_mut(&id).unwrap();
         track.try_set_path(path).await;
-        self.tx.send(Event::Acquired { id }).ok();
+        self.tx
+            .send(EventEnvelope {
+                span: Span::current(),
+                event: Event::Acquired { id },
+            })
+            .ok();
     }
 
     #[instrument(skip(self))]
@@ -203,9 +219,12 @@ impl State {
     ) -> ChannelResult<()> {
         let mut data = self.data.lock().await;
         self.rotate_track(&mut data, &id);
-        self.tx.send(Event::Removed {
-            id,
-            e: Some((origin_id, e)),
+        self.tx.send(EventEnvelope {
+            span: Span::current(),
+            event: Event::Removed {
+                id,
+                e: Some((origin_id, e)),
+            },
         })?;
         Ok(())
     }

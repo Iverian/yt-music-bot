@@ -10,7 +10,7 @@ use rodio::{Decoder, OutputStream, Sink};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::instrument;
+use tracing::{instrument, Span};
 
 use crate::util::channel::ChannelError;
 
@@ -18,11 +18,11 @@ pub const MIN_VOLUME: u8 = 1;
 pub const MAX_VOLUME: u8 = 20;
 
 pub type Result<T> = core::result::Result<T, Error>;
-pub type EventTx = mpsc::UnboundedSender<Event>;
+pub type EventTx = mpsc::UnboundedSender<EventEnvelope>;
 pub type OriginId = usize;
 pub type QueueId = usize;
 pub type Response = Option<Status>;
-pub type Receiver = UnboundedReceiverStream<Event>;
+pub type Receiver = UnboundedReceiverStream<EventEnvelope>;
 
 #[derive(Debug)]
 pub struct Player {
@@ -49,14 +49,15 @@ pub struct Status {
     pub volume_level: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Event {
+#[derive(Debug, Clone)]
+pub struct EventEnvelope {
+    pub span: Span,
     pub origin_id: OriginId,
-    pub kind: EventKind,
+    pub event: Event,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum EventKind {
+pub enum Event {
     PlaybackStarted,
     PlaybackPaused,
     PlaybackStopped,
@@ -102,6 +103,7 @@ type Callback = EmptyCallback<f32>;
 #[derive(Debug)]
 struct RequestEnvelope {
     tx: ResponseTx,
+    span: Span,
     origin_id: OriginId,
     payload: Request,
 }
@@ -130,6 +132,7 @@ impl Player {
         self.tx
             .send(RequestEnvelope {
                 tx,
+                span: Span::current(),
                 origin_id,
                 payload,
             })
@@ -152,7 +155,7 @@ impl Worker {
         let worker = Worker {
             sink,
             tx,
-            volume_level: 10u8,
+            volume_level: MAX_VOLUME,
             is_muted: false,
         };
         stx.send(Ok(())).unwrap();
@@ -168,19 +171,19 @@ impl Worker {
         Ok((stream, sink))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     fn serve_forever(mut self, mut rx: RequestRx) {
-        loop {
-            let Some(RequestEnvelope {
-                tx,
-                origin_id,
-                payload,
-            }) = rx.blocking_recv()
-            else {
-                return;
-            };
-            tracing::info!(request=?payload, "player request");
-            tx.send(self.request_handler(origin_id, payload)).ok();
+        while let Some(RequestEnvelope {
+            tx,
+            span,
+            origin_id,
+            payload,
+        }) = rx.blocking_recv()
+        {
+            span.in_scope(|| {
+                tracing::info!(request=?payload, "player request");
+                tx.send(self.request_handler(origin_id, payload)).ok();
+            });
         }
     }
 
@@ -246,7 +249,7 @@ impl Worker {
     fn queue_handler(&mut self, origin_id: OriginId, path: Utf8PathBuf, id: usize) -> Result<()> {
         let track = open_track(path).map_err(|_| Error::InvalidTrack)?;
 
-        self.send(origin_id, EventKind::TrackAdded(id));
+        self.send(origin_id, Event::TrackAdded(id));
         self.sink
             .append(cb_track_started(self.tx.clone(), origin_id, id));
         self.sink.append(track);
@@ -258,7 +261,7 @@ impl Worker {
     #[instrument(skip(self))]
     fn change_volume_handler(&mut self, origin_id: OriginId, modifier: i8) {
         self.volume_level = change_level(self.volume_level, modifier);
-        self.send(origin_id, EventKind::Volume(self.volume_level));
+        self.send(origin_id, Event::Volume(self.volume_level));
         if !self.is_muted {
             self.sink.set_volume(level_to_volume(self.volume_level));
         }
@@ -270,7 +273,7 @@ impl Worker {
             return Err(Error::InvalidVolumeLevel);
         }
         self.volume_level = level;
-        self.send(origin_id, EventKind::Volume(self.volume_level));
+        self.send(origin_id, Event::Volume(self.volume_level));
         if !self.is_muted {
             self.sink.set_volume(level_to_volume(self.volume_level));
         }
@@ -280,11 +283,11 @@ impl Worker {
     #[instrument(skip(self))]
     fn mute_toggle_handler(&mut self, origin_id: OriginId) {
         if self.is_muted {
-            self.send(origin_id, EventKind::Unmuted);
+            self.send(origin_id, Event::Unmuted);
             self.is_muted = false;
             self.sink.set_volume(level_to_volume(self.volume_level));
         } else {
-            self.send(origin_id, EventKind::Muted);
+            self.send(origin_id, Event::Muted);
             self.is_muted = true;
             self.sink.set_volume(0.);
         }
@@ -295,7 +298,7 @@ impl Worker {
         if !self.is_muted {
             return;
         }
-        self.send(origin_id, EventKind::Unmuted);
+        self.send(origin_id, Event::Unmuted);
         self.is_muted = false;
         self.sink.set_volume(level_to_volume(self.volume_level));
     }
@@ -305,7 +308,7 @@ impl Worker {
         if self.is_muted {
             return;
         }
-        self.send(origin_id, EventKind::Muted);
+        self.send(origin_id, Event::Muted);
         self.is_muted = true;
         self.sink.set_volume(0.);
     }
@@ -322,7 +325,7 @@ impl Worker {
     #[instrument(skip(self))]
     fn stop_handler(&mut self, origin_id: OriginId) {
         if !self.sink.empty() {
-            self.send(origin_id, EventKind::PlaybackStopped);
+            self.send(origin_id, Event::PlaybackStopped);
         }
         self.sink.clear();
         self.sink.pause();
@@ -331,10 +334,10 @@ impl Worker {
     #[instrument(skip(self))]
     fn play_toggle_handler(&mut self, origin_id: OriginId) {
         if self.sink.is_paused() {
-            self.send(origin_id, EventKind::PlaybackStarted);
+            self.send(origin_id, Event::PlaybackStarted);
             self.sink.play();
         } else {
-            self.send(origin_id, EventKind::PlaybackPaused);
+            self.send(origin_id, Event::PlaybackPaused);
             self.sink.pause();
         }
     }
@@ -342,7 +345,7 @@ impl Worker {
     #[instrument(skip(self))]
     fn pause_handler(&mut self, origin_id: OriginId) {
         if !self.sink.is_paused() {
-            self.send(origin_id, EventKind::PlaybackPaused);
+            self.send(origin_id, Event::PlaybackPaused);
         }
         self.sink.pause();
     }
@@ -350,14 +353,20 @@ impl Worker {
     #[instrument(skip(self))]
     fn play_handler(&mut self, origin_id: OriginId) {
         if self.sink.is_paused() {
-            self.send(origin_id, EventKind::PlaybackStarted);
+            self.send(origin_id, Event::PlaybackStarted);
         }
         self.sink.play();
     }
 
     #[instrument(skip(self))]
-    fn send(&self, origin_id: OriginId, e: EventKind) {
-        self.tx.send(Event { origin_id, kind: e }).unwrap();
+    fn send(&self, origin_id: OriginId, e: Event) {
+        self.tx
+            .send(EventEnvelope {
+                span: Span::current(),
+                origin_id,
+                event: e,
+            })
+            .unwrap();
     }
 }
 
@@ -368,10 +377,12 @@ fn open_track(path: Utf8PathBuf) -> AnyResult<OpenTrack> {
 
 #[instrument(skip(tx))]
 fn cb_track_started(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
+    let span = Span::current();
     cb_source(move || {
-        tx.send(Event {
+        tx.send(EventEnvelope {
+            span: span.clone(),
             origin_id,
-            kind: EventKind::TrackStarted(id),
+            event: Event::TrackStarted(id),
         })
         .ok();
     })
@@ -379,10 +390,12 @@ fn cb_track_started(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
 
 #[instrument(skip(tx))]
 fn cb_track_finished(tx: EventTx, origin_id: OriginId, id: QueueId) -> Callback {
+    let span = Span::current();
     cb_source(move || {
-        tx.send(Event {
+        tx.send(EventEnvelope {
+            span: span.clone(),
             origin_id,
-            kind: EventKind::TrackFinished(id),
+            event: Event::TrackFinished(id),
         })
         .ok();
     })
@@ -395,12 +408,12 @@ where
     EmptyCallback::new(Box::new(f))
 }
 
+#[instrument]
 fn level_to_volume(level: u8) -> f32 {
-    let mul = VOLUME_LEVELS[level.wrapping_sub(1) as usize];
-    tracing::debug!(level = level, mul = mul, "volume");
-    mul
+    VOLUME_LEVELS[level.wrapping_sub(1) as usize]
 }
 
+#[instrument]
 fn change_level(level: u8, modifier: i8) -> u8 {
     if (level == MIN_VOLUME && modifier < 0) || (level == MAX_VOLUME && modifier > 0) {
         return level;

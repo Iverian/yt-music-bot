@@ -14,14 +14,18 @@ use thiserror::Error;
 use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
+use tracing::{instrument, Instrument, Span};
 use url::Url;
 
 use crate::player::{
-    Error as PlayerError, Event as PlayerEvent, EventKind as PlayerEventKind, OriginId, Player,
-    QueueId, Receiver as PlayerReceiver, Request as PlayerRequest, Result as PlayerResult,
+    Error as PlayerError, Event as PlayerEventKind, Event as PlayerEvent,
+    EventEnvelope as PlayerEventEnvelope, OriginId, Player, QueueId, Receiver as PlayerReceiver,
+    Request as PlayerRequest, Result as PlayerResult,
 };
-use crate::track_manager::{Event as ManagerEvent, Receiver as ManagerReceiver, TrackManager};
+use crate::track_manager::{
+    Event as ManagerEvent, EventEnvelope as ManagerEventEnvelope, Receiver as ManagerReceiver,
+    TrackManager,
+};
 use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track, TrackId, Youtube};
 
@@ -83,7 +87,8 @@ pub enum Event {
 }
 
 #[derive(Clone)]
-pub struct EventWrapper {
+pub struct EventEnvelope {
+    pub span: Span,
     pub origin_id: OriginId,
     pub event: Event,
 }
@@ -136,14 +141,14 @@ pub struct QueueData {
 
 #[derive(Debug)]
 #[pin_project]
-pub struct Receiver(#[pin] BroadcastStream<EventWrapper>);
+pub struct Receiver(#[pin] BroadcastStream<EventEnvelope>);
 
 #[derive(Debug)]
 #[pin_project]
-pub struct ReceiverWrapped(#[pin] BroadcastStream<EventWrapper>);
+pub struct ReceiverWrapped(#[pin] BroadcastStream<EventEnvelope>);
 
-type EventTx = broadcast::Sender<EventWrapper>;
-type EventRx = broadcast::Receiver<EventWrapper>;
+type EventTx = broadcast::Sender<EventEnvelope>;
+type EventRx = broadcast::Receiver<EventEnvelope>;
 type Map<K, V> = BTreeMap<K, V>;
 
 #[derive(Debug)]
@@ -162,8 +167,8 @@ struct Broadcast(EventTx);
 struct BroadcastProxy<'a>(&'a EventTx, OriginId);
 
 enum MergedEvent {
-    Player(PlayerEvent),
-    Manager(ManagerEvent),
+    Player(PlayerEventEnvelope),
+    Manager(ManagerEventEnvelope),
     Cancel,
 }
 
@@ -212,32 +217,10 @@ impl Receiver {
     fn new(rx: EventRx) -> Self {
         Self(BroadcastStream::new(rx))
     }
-
-    #[instrument(skip_all)]
-    pub fn wrap(self) -> ReceiverWrapped {
-        ReceiverWrapped(self.0)
-    }
 }
 
 impl Stream for Receiver {
-    type Item = Event;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        match ready!(self.project().0.poll_next(cx)) {
-            Some(x) => match x {
-                Ok(x) => Poll::Ready(Some(x.event)),
-                Err(_) => Poll::Pending,
-            },
-            None => Poll::Ready(None),
-        }
-    }
-}
-
-impl Stream for ReceiverWrapped {
-    type Item = EventWrapper;
+    type Item = EventEnvelope;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -409,7 +392,12 @@ impl Sender {
 impl Broadcast {
     #[instrument(skip(self))]
     fn send(&self, origin_id: OriginId, event: Event) -> ChannelResult<()> {
-        self.0.send(EventWrapper { origin_id, event })?;
+        let span = tracing::info_span!("broadcast controller message");
+        self.0.send(EventEnvelope {
+            span,
+            origin_id,
+            event,
+        })?;
         Ok(())
     }
 
@@ -422,7 +410,9 @@ impl Broadcast {
 impl<'a> BroadcastProxy<'a> {
     #[instrument(skip(self))]
     fn send(&self, event: Event) -> ChannelResult<()> {
-        self.0.send(EventWrapper {
+        let span = tracing::info_span!("broadcast controller message");
+        self.0.send(EventEnvelope {
+            span,
             origin_id: self.1,
             event,
         })?;
@@ -471,11 +461,19 @@ impl State {
 
         while let Some(e) = stream.next().await {
             match e {
-                MergedEvent::Player(e) => {
-                    self.handle_player_event(&tx, e).await?;
+                MergedEvent::Player(PlayerEventEnvelope {
+                    span,
+                    origin_id,
+                    event,
+                }) => {
+                    self.handle_player_event(&tx, origin_id, event)
+                        .instrument(span)
+                        .await?;
                 }
-                MergedEvent::Manager(e) => {
-                    self.handle_track_manager_event(&tx, e).await?;
+                MergedEvent::Manager(ManagerEventEnvelope { span, event }) => {
+                    self.handle_track_manager_event(&tx, event)
+                        .instrument(span)
+                        .await?;
                 }
                 MergedEvent::Cancel => {
                     break;
@@ -486,11 +484,16 @@ impl State {
         Ok(())
     }
 
-    #[instrument(skip_all)]
-    async fn handle_player_event(&self, tx: &Broadcast, e: PlayerEvent) -> AnyResult<()> {
+    #[instrument(skip(self, tx))]
+    async fn handle_player_event(
+        &self,
+        tx: &Broadcast,
+        origin_id: OriginId,
+        e: PlayerEvent,
+    ) -> AnyResult<()> {
         tracing::debug!(event = ?e, "player event");
-        let tx = tx.proxy(e.origin_id);
-        match e.kind {
+        let tx = tx.proxy(origin_id);
+        match e {
             PlayerEventKind::Muted => tx.send(Event::Muted)?,
             PlayerEventKind::Unmuted => tx.send(Event::Unmuted)?,
             PlayerEventKind::Volume(level) => tx.send(Event::Volume { level })?,
@@ -507,7 +510,6 @@ impl State {
             }
             PlayerEventKind::TrackStarted(queue_id) => {
                 let data = self.data.read().await;
-                // data.queue_player(&self.player).await?;
                 tx.send(Event::NowPlaying {
                     queue_id,
                     track: data.get_queued_track(queue_id).meta.clone(),
@@ -533,9 +535,8 @@ impl State {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip(self, tx))]
     async fn handle_track_manager_event(&self, tx: &Broadcast, e: ManagerEvent) -> AnyResult<()> {
-        tracing::debug!(event = ?e, "track manager event");
         match e {
             ManagerEvent::Acquired { id } => {
                 let mut data = self.data.write().await;

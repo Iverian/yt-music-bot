@@ -10,7 +10,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatAction, Message, ParseMode};
 use teloxide::utils::command::BotCommands as _;
 use teloxide::{filter_command, Bot};
-use tracing::instrument;
+use tracing::{instrument, Instrument, Span};
 use url::Url;
 
 use super::defs::{CONFIRM_TEXT, TRACKS_IN_MESSAGE};
@@ -206,57 +206,50 @@ async fn queue(
     urls: ArgumentList<Url>,
 ) -> HandlerResult {
     let urls = urls.into_vec();
-
     reply(&bot, &msg, "Ищу треки...").await?;
-
-    tokio::spawn(async move {
-        if let Err(err) = queue_impl(tx, urls, state, bot, msg).await {
-            tracing::debug!(error=?err, "error queueing tracks");
-        }
-    });
-
+    tokio::spawn(queue_impl(tx, urls, state, bot, msg).instrument(Span::current()));
     Ok(())
 }
 
 #[instrument(skip(tx, state, bot))]
-async fn queue_impl(
-    tx: ControllerSender,
-    urls: Vec<Url>,
-    state: State,
-    bot: Bot,
-    msg: Message,
-) -> AnyResult<()> {
-    let tracks = match tx.resolve(urls).await {
-        Ok(x) => x,
-        Err(e) => {
-            reply(&bot, &msg, format!("❗ Ошибка поиска: {e}")).await?;
+async fn queue_impl(tx: ControllerSender, urls: Vec<Url>, state: State, bot: Bot, msg: Message) {
+    let fut = async move {
+        let tracks = match tx.resolve(urls).await {
+            Ok(x) => x,
+            Err(e) => {
+                reply(&bot, &msg, format!("❗ Ошибка поиска: {e}")).await?;
+                return Ok(());
+            }
+        };
+
+        let before = tracks.len();
+        let tracks = filter_tracks(tracks, state.settings());
+        let filtered = before - tracks.len();
+
+        if tracks.is_empty() {
+            reply(&bot, &msg, "Все треки были отфильтрованы").await?;
             return Ok(());
         }
+
+        state.request(&msg, tx.queue(tracks)).await?;
+
+        reply(
+            &bot,
+            &msg,
+            if filtered == 0 {
+                CONFIRM_TEXT.to_owned()
+            } else {
+                format!("{filtered} треков было отфильтровано")
+            },
+        )
+        .await?;
+
+        Ok(()) as AnyResult<()>
     };
 
-    let before = tracks.len();
-    let tracks = filter_tracks(tracks, state.settings());
-    let filtered = before - tracks.len();
-
-    if tracks.is_empty() {
-        reply(&bot, &msg, "Все треки были отфильтрованы").await?;
-        return Ok(());
+    if let Err(err) = fut.await {
+        tracing::debug!(error=?err, "error queueing tracks");
     }
-
-    state.request(&msg, tx.queue(tracks)).await?;
-
-    reply(
-        &bot,
-        &msg,
-        if filtered == 0 {
-            CONFIRM_TEXT.to_owned()
-        } else {
-            format!("{filtered} треков было отфильтровано")
-        },
-    )
-    .await?;
-
-    Ok(())
 }
 
 #[instrument(skip(bot, tx))]
@@ -366,7 +359,7 @@ fn filter_tracks(tracks: Vec<Track>, settings: &Settings) -> Vec<Track> {
     let mut cur = Duration::ZERO;
     tracks
         .into_iter()
-        .filter(|x| !settings.only_music_tracks || x.is_music_track)
+        .filter(|x| !settings.only_music_tracks || x.is_music)
         .take_while(|x| {
             cur += x.duration;
             cur <= settings.max_request_duration

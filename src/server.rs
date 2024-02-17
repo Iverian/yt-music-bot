@@ -15,16 +15,17 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
+use tracing::{instrument, Instrument, Span};
 
 use crate::controller::{
-    Controller, Error as ControllerError, Event, QueuedTrackState, Receiver as ControllerReceiver,
-    Sender as ControllerSender,
+    Controller, Error as ControllerError, Event, EventEnvelope, QueuedTrackState,
+    Receiver as ControllerReceiver, Sender as ControllerSender,
 };
 use crate::player::{Error as PlayerError, MAX_VOLUME};
 use crate::util::channel::{ChannelError, ChannelResult};
 use crate::youtube::{Error as YoutubeError, Track};
 
+const WRITER_CAPACITY: usize = 4;
 const VOLUME_ERROR_MSG: &str = "invalid volume level; volume must be between 0 and 10";
 
 pub fn spawn(
@@ -39,8 +40,8 @@ pub fn spawn(
     Ok(task)
 }
 
-type WriterTx = mpsc::UnboundedSender<WriteMessage>;
-type WriterRx = mpsc::UnboundedReceiver<WriteMessage>;
+type WriterTx = mpsc::Sender<WriteEnvelope>;
+type WriterRx = mpsc::Receiver<WriteEnvelope>;
 type Reader = BufReader<OwnedReadHalf>;
 type Result<T> = core::result::Result<T, Error>;
 
@@ -92,6 +93,12 @@ enum VolumeCommand {
     Set(u8),
 }
 
+struct WriteEnvelope {
+    span: Span,
+    message: WriteMessage,
+}
+
+#[derive(Debug)]
 enum WriteMessage {
     SetPrompt,
     ClearPrompt,
@@ -163,23 +170,24 @@ impl Connection {
             tracing::debug!(error = ?e, "unhandled error in connection");
         }
         tracing::debug!("closing admin connection");
-        self.writer.write("Bye!").ok();
-        self.writer.close();
+        self.writer.write("Bye!").await.ok();
+        self.writer.close().await;
     }
 
+    #[instrument(skip_all)]
     async fn serve_forever_impl(&mut self, mut rdr: Reader) -> AnyResult<()> {
         let mut buf = String::new();
 
-        self.writer.write("Hello!")?;
+        self.writer.write("Hello!").await?;
         loop {
             buf.clear();
-            self.writer.set_prompt()?;
+            self.writer.set_prompt().await?;
             tokio::select! {
                 r = rdr.read_line(&mut buf) => {
                     if r? == 0 {
                         break;
                     }
-                    self.writer.clear_prompt()?;
+                    self.writer.clear_prompt().await?;
                     if self.handle_wrapper(&buf).await {
                         break;
                     }
@@ -192,32 +200,36 @@ impl Connection {
 
         Ok(())
     }
+
     #[instrument(skip(self))]
     async fn handle_wrapper(&mut self, request: &str) -> bool {
-        self.handle_request(request)
-            .await
-            .or_else(|e| self.handle_error(e))
-            .unwrap_or(true)
+        match self.handle_request(request).await {
+            Ok(x) => x,
+            Err(e) => self.handle_error(e).await.unwrap_or(true),
+        }
     }
 
     #[instrument(skip(self))]
-    fn handle_error(&mut self, e: Error) -> Result<bool> {
+    async fn handle_error(&mut self, e: Error) -> Result<bool> {
         match e {
             Error::Channel(_) => {
                 return Ok(true);
             }
             Error::Player(e) => {
                 self.writer
-                    .write_many(vec!["[x] Player error".to_owned(), format!("... {e}")])?;
+                    .write_many(vec!["[x] Player error".to_owned(), format!("... {e}")])
+                    .await?;
             }
             Error::Youtube(e) => {
-                self.writer.write_many(vec![
-                    "[x] Youtube download error".to_owned(),
-                    format!("... {e}"),
-                ])?;
+                self.writer
+                    .write_many(vec![
+                        "[x] Youtube download error".to_owned(),
+                        format!("... {e}"),
+                    ])
+                    .await?;
             }
             e => {
-                self.writer.write(format!("[x] {e}"))?;
+                self.writer.write(format!("[x] {e}")).await?;
             }
         }
         Ok(false)
@@ -280,13 +292,15 @@ impl Connection {
             }
             Command::Info => {
                 let status = self.tx.status().await?;
-                self.writer.write(format!(
-                    "... [{:1}] {:6} {:2} : {} in queue",
-                    if status.is_paused { "⏸" } else { "▶️" },
-                    if status.is_muted { "muted" } else { "volume" },
-                    status.volume_level,
-                    status.length,
-                ))?;
+                self.writer
+                    .write(format!(
+                        "... [{:1}] {:6} {:2} : {} in queue",
+                        if status.is_paused { "⏸" } else { "▶️" },
+                        if status.is_muted { "muted" } else { "volume" },
+                        status.volume_level,
+                        status.length,
+                    ))
+                    .await?;
             }
         }
 
@@ -361,7 +375,7 @@ impl Connection {
     async fn list_queue_request(&mut self) -> Result<()> {
         let view = self.tx.view().await;
         if view.queue.is_empty() {
-            self.writer.write("... Queue is empty")?;
+            self.writer.write("... Queue is empty").await?;
         } else {
             let queue = view
                 .iter()
@@ -380,41 +394,58 @@ impl Connection {
                     format!("... ({idx:02}) [{state:1}] {}", TrackFmt(j.track))
                 })
                 .collect_vec();
-            self.writer.write_many(queue)?;
+            self.writer.write_many(queue).await?;
         }
         Ok(())
     }
 
     #[instrument(skip_all)]
     async fn serve_notifications(mut rx: ControllerReceiver, wrt: Writer) {
-        while let Some(e) = rx.next().await {
-            if Self::handle_notification(e, &wrt).is_err() {
+        while let Some(EventEnvelope {
+            span,
+            origin_id: _,
+            event,
+        }) = rx.next().await
+        {
+            if Self::handle_notification(event, &wrt)
+                .instrument(span)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     }
 
     #[instrument(skip(writer))]
-    fn handle_notification(e: Event, writer: &Writer) -> ChannelResult<()> {
+    async fn handle_notification(e: Event, writer: &Writer) -> ChannelResult<()> {
         match e {
-            Event::Muted => writer.write("[*] Muted"),
-            Event::Unmuted => writer.write("[*] Unmuted"),
-            Event::Volume { level } => writer.write(format!("[*] Volume level is {level}")),
-            Event::PlaybackStarted => writer.write("[*] Started"),
-            Event::PlaybackPaused => writer.write("[*] Paused"),
-            Event::PlaybackStopped => writer.write("[*] Stopped"),
-            Event::QueueFinished => writer.write("[*] Queue completed"),
-            Event::WaitingForDownload => writer.write("[*] Waiting for track download"),
+            Event::Muted => writer.write("[*] Muted").await,
+            Event::Unmuted => writer.write("[*] Unmuted").await,
+            Event::Volume { level } => writer.write(format!("[*] Volume level is {level}")).await,
+            Event::PlaybackStarted => writer.write("[*] Started").await,
+            Event::PlaybackPaused => writer.write("[*] Paused").await,
+            Event::PlaybackStopped => writer.write("[*] Stopped").await,
+            Event::QueueFinished => writer.write("[*] Queue completed").await,
+            Event::WaitingForDownload => writer.write("[*] Waiting for track download").await,
             Event::NowPlaying { queue_id: _, track } => {
-                writer.write(format!("[*] Now playing: {}", TrackFmt(&track)))
+                writer
+                    .write(format!("[*] Now playing: {}", TrackFmt(&track)))
+                    .await
             }
-            Event::DownloadError { track, err } => writer.write(format!(
-                "[*] Error downloading track {}: {}",
-                TrackFmt(&track),
-                err
-            )),
+            Event::DownloadError { track, err } => {
+                writer
+                    .write(format!(
+                        "[*] Error downloading track {}: {}",
+                        TrackFmt(&track),
+                        err
+                    ))
+                    .await
+            }
             Event::TracksQueued { tracks } => {
-                writer.write(format!("[*] {} tracks queued", tracks.len()))
+                writer
+                    .write(format!("[*] {} tracks queued", tracks.len()))
+                    .await
             }
         }
     }
@@ -423,7 +454,7 @@ impl Connection {
 impl Writer {
     #[instrument(skip_all)]
     fn new(writer: OwnedWriteHalf) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(WRITER_CAPACITY);
         let result = Self(tx);
         let worker = WriterWorker {
             writer: BufWriter::new(writer),
@@ -434,54 +465,78 @@ impl Writer {
     }
 
     #[instrument(skip_all)]
-    fn close(&self) {
-        self.0.send(WriteMessage::Exit).ok();
+    async fn close(&self) {
+        self.0
+            .send(WriteEnvelope {
+                span: Span::current(),
+                message: WriteMessage::Exit,
+            })
+            .await
+            .ok();
     }
 
     #[instrument(skip_all)]
-    fn set_prompt(&self) -> ChannelResult<()> {
-        self.0.send(WriteMessage::SetPrompt)?;
+    async fn set_prompt(&self) -> ChannelResult<()> {
+        self.0
+            .send(WriteEnvelope {
+                span: Span::current(),
+                message: WriteMessage::SetPrompt,
+            })
+            .await?;
         Ok(())
     }
 
     #[instrument(skip_all)]
-    fn clear_prompt(&self) -> ChannelResult<()> {
-        self.0.send(WriteMessage::ClearPrompt)?;
+    async fn clear_prompt(&self) -> ChannelResult<()> {
+        self.0
+            .send(WriteEnvelope {
+                span: Span::current(),
+                message: WriteMessage::ClearPrompt,
+            })
+            .await?;
         Ok(())
     }
 
     #[instrument(skip(self))]
-    fn write<S>(&self, line: S) -> ChannelResult<()>
+    async fn write<S>(&self, line: S) -> ChannelResult<()>
     where
         S: Into<String> + Debug,
     {
-        self.write_many(vec![line.into()])
+        self.write_many(vec![line.into()]).await
     }
 
     #[instrument(skip(self))]
-    fn write_many(&self, lines: Vec<String>) -> ChannelResult<()> {
-        self.0.send(WriteMessage::Lines(lines))?;
+    async fn write_many(&self, lines: Vec<String>) -> ChannelResult<()> {
+        self.0
+            .send(WriteEnvelope {
+                span: Span::current(),
+                message: WriteMessage::Lines(lines),
+            })
+            .await?;
         Ok(())
     }
 }
 
 impl WriterWorker {
-    #[instrument(skip_all)]
     async fn serve_forever(mut self, mut rx: WriterRx) {
-        while let Some(x) = rx.recv().await {
-            let stop = match x {
-                WriteMessage::Exit => true,
-                WriteMessage::SetPrompt => self.handle_prompt().await.is_err(),
-                WriteMessage::ClearPrompt => {
-                    self.prompt = false;
-                    false
-                }
-                WriteMessage::Lines(lines) => self.handle_message(lines).await.is_err(),
-            };
-            if stop {
+        while let Some(WriteEnvelope { span, message }) = rx.recv().await {
+            if self.handle(message).instrument(span).await {
                 self.close(rx).await;
                 break;
             }
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn handle(&mut self, message: WriteMessage) -> bool {
+        match message {
+            WriteMessage::Exit => true,
+            WriteMessage::SetPrompt => self.handle_prompt().await.is_err(),
+            WriteMessage::ClearPrompt => {
+                self.prompt = false;
+                false
+            }
+            WriteMessage::Lines(lines) => self.handle_message(lines).await.is_err(),
         }
     }
 

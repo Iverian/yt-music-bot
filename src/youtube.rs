@@ -13,7 +13,7 @@ use regex::Regex;
 use rust_embed::RustEmbed;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tracing::instrument;
+use tracing::{instrument, Span};
 use url::Url;
 
 use crate::util::channel::ChannelError;
@@ -71,7 +71,7 @@ pub struct Track {
     pub artist: Vec<String>,
     pub webpage_url: Url,
     pub duration: Duration,
-    pub is_music_track: bool,
+    pub is_music: bool,
     pub path: Utf8PathBuf,
 }
 
@@ -108,6 +108,7 @@ struct ErrorRaw {
 
 #[derive(Debug)]
 struct RequestEnvelope {
+    span: Span,
     tx: ResponseTx,
     payload: Request,
 }
@@ -170,7 +171,11 @@ impl Youtube {
     async fn request(&self, payload: Request) -> Result<Response> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(RequestEnvelope { tx, payload })
+            .send(RequestEnvelope {
+                span: Span::current(),
+                tx,
+                payload,
+            })
             .await
             .map_err(|_| ChannelError)?;
         rx.await.map_err(|_| ChannelError)?
@@ -178,13 +183,10 @@ impl Youtube {
 }
 
 impl<'a> Worker<'a> {
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     fn serve_forever(self, mut rx: RequestRx) {
-        loop {
-            let Some(RequestEnvelope { tx, payload }) = rx.blocking_recv() else {
-                return;
-            };
-            tx.send(self.request_handler(payload)).ok();
+        while let Some(RequestEnvelope { span, tx, payload }) = rx.blocking_recv() {
+            span.in_scope(|| tx.send(self.request_handler(payload)).ok());
         }
     }
 
@@ -293,7 +295,7 @@ impl From<TrackRaw> for Track {
             artist: value.artist,
             webpage_url: value.webpage_url.parse().unwrap(),
             duration: Duration::from_secs(value.duration_s),
-            is_music_track: value.is_music_track,
+            is_music: value.is_music_track,
             path: value.path.parse().unwrap(),
         }
     }
